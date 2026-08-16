@@ -107,11 +107,11 @@ export async function runHook(
     const stderrDone = new Promise<void>((done) => proc.stderr.once('end', done));
     void Promise.all([proc.wait(), stdoutDone, stderrDone]).then(
       ([code]) => {
-        proc.dispose();
+        void proc.dispose();
         settle(resultFromExitCode(code, stdout, stderr));
       },
       (error) => {
-        proc.dispose();
+        void proc.dispose();
         settle(allowResult({ stdout, stderr: stderr + errorMessage(error) }));
       },
     );

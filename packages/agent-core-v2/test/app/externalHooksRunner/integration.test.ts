@@ -46,10 +46,10 @@ import { IEventBus } from '#/app/event/eventBus';
 import { EventBusService } from '#/app/event/eventBusService';
 import { IFlagService } from '#/app/flag/flag';
 import { IPluginService } from '#/app/plugin/plugin';
+import { ISessionManager } from '#/app/sessionManager/sessionManager';
 import { IHostProcessService } from '#/os/interface/hostProcess';
 import { HostProcessService } from '#/os/backends/node-local/hostProcessService';
 import {
-  ISessionLifecycleService,
   type SessionCloseReason,
   type SessionCreatedEvent,
   type SessionCreateSource,
@@ -556,7 +556,7 @@ describe('IExternalHooksRunnerService integration', () => {
                 ? 'sessions/workspace-1/session-1'
                 : `sessions/workspace-1/session-1/${subKey}`,
           });
-          reg.definePartialInstance(ISessionLifecycleService, stubSessionLifecycle().service);
+          reg.definePartialInstance(ISessionManager, stubSessionLifecycle().service);
           reg.defineInstance(ISessionMetadata, stubSessionMetadata());
           reg.defineInstance(ISessionAgentProfileCatalog, stubProfileCatalog());
           reg.defineInstance(IModelService, stubModelService());
@@ -895,7 +895,7 @@ describe('IExternalHooksRunnerService integration', () => {
                 ? 'sessions/workspace-1/session-1'
                 : `sessions/workspace-1/session-1/${subKey}`,
           });
-          reg.definePartialInstance(ISessionLifecycleService, lifecycle.service);
+          reg.definePartialInstance(ISessionManager, lifecycle.service);
           reg.defineInstance(ISessionMetadata, stubSessionMetadata());
           reg.defineInstance(ISessionAgentProfileCatalog, stubProfileCatalog());
           reg.defineInstance(IModelService, stubModelService());
@@ -1092,7 +1092,7 @@ describe('IExternalHooksRunnerService integration', () => {
         additionalServices: (reg) => {
           registerStateServices(reg);
           reg.defineInstance(ISessionContext, stubSessionContext());
-          reg.definePartialInstance(ISessionLifecycleService, lifecycle.service);
+          reg.definePartialInstance(ISessionManager, lifecycle.service);
           reg.defineInstance(ISessionMetadata, stubSessionMetadata('My Session'));
           reg.defineInstance(ISessionAgentProfileCatalog, stubProfileCatalog('coder'));
           reg.defineInstance(IModelService, stubModelService('kimi-k2'));
@@ -1280,7 +1280,7 @@ describe('IExternalHooksRunnerService integration', () => {
         additionalServices: (reg) => {
           registerStateServices(reg);
           reg.defineInstance(ISessionContext, stubSessionContext());
-          reg.definePartialInstance(ISessionLifecycleService, stubSessionLifecycle().service);
+          reg.definePartialInstance(ISessionManager, stubSessionLifecycle().service);
           reg.defineInstance(ISessionMetadata, stubSessionMetadata());
           reg.defineInstance(ISessionAgentProfileCatalog, stubProfileCatalog());
           reg.defineInstance(IModelService, stubModelService());
@@ -1325,7 +1325,7 @@ describe('IExternalHooksRunnerService integration', () => {
         additionalServices: (reg) => {
           registerStateServices(reg);
           reg.defineInstance(ISessionContext, stubSessionContext());
-          reg.definePartialInstance(ISessionLifecycleService, stubSessionLifecycle().service);
+          reg.definePartialInstance(ISessionManager, stubSessionLifecycle().service);
           reg.defineInstance(ISessionMetadata, stubSessionMetadata());
           reg.defineInstance(ISessionAgentProfileCatalog, stubProfileCatalog());
           reg.defineInstance(IModelService, stubModelService());
@@ -1372,7 +1372,7 @@ describe('IExternalHooksRunnerService integration', () => {
         additionalServices: (reg) => {
           registerStateServices(reg);
           reg.defineInstance(ISessionContext, stubSessionContext());
-          reg.definePartialInstance(ISessionLifecycleService, stubSessionLifecycle().service);
+          reg.definePartialInstance(ISessionManager, stubSessionLifecycle().service);
           reg.defineInstance(ISessionMetadata, stubSessionMetadata());
           reg.defineInstance(ISessionAgentProfileCatalog, stubProfileCatalog());
           reg.defineInstance(IModelService, stubModelService());
