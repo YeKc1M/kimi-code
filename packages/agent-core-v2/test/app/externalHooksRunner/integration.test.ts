@@ -38,11 +38,13 @@ import { IAgentToolExecutorService } from '#/agent/toolExecutor/toolExecutor';
 import { IExternalHooksRunnerService } from '#/app/externalHooksRunner/externalHooksRunner';
 import { ExternalHooksRunnerService } from '#/app/externalHooksRunner/externalHooksRunnerService';
 import { makeHookRunner } from '../../agent/externalHooks/runner-stub';
+import { stubFlag } from '../flag/stubs';
 import type { AgentTaskInfo } from '#/agent/task/task';
 import { IBootstrapService } from '#/app/bootstrap/bootstrap';
 import { IConfigService } from '#/app/config/config';
 import { IEventBus } from '#/app/event/eventBus';
 import { EventBusService } from '#/app/event/eventBusService';
+import { IFlagService } from '#/app/flag/flag';
 import { IPluginService } from '#/app/plugin/plugin';
 import { IHostProcessService } from '#/os/interface/hostProcess';
 import { HostProcessService } from '#/os/backends/node-local/hostProcessService';
@@ -336,6 +338,7 @@ describe('IExternalHooksRunnerService integration', () => {
             hooks: createHooks(['onWillCompact']),
           });
           reg.definePartialInstance(IAgentTaskService, {});
+          reg.defineInstance(IFlagService, stubFlag(false));
         },
       });
       ix.set(IExternalHooksRunnerService, stubHookRunner(hookEngine));
@@ -441,6 +444,7 @@ describe('IExternalHooksRunnerService integration', () => {
             hooks: createHooks(['onWillCompact']),
           });
           reg.definePartialInstance(IAgentTaskService, {});
+          reg.defineInstance(IFlagService, stubFlag(false));
         },
       });
       ix.set(IExternalHooksRunnerService, stubHookRunner(hookEngine));
@@ -649,6 +653,7 @@ describe('IExternalHooksRunnerService integration', () => {
             hooks: createHooks(['onWillCompact']),
           });
           reg.definePartialInstance(IAgentTaskService, {});
+          reg.defineInstance(IFlagService, stubFlag(false));
           reg.define(IHostProcessService, HostProcessService);
         },
       });
@@ -1179,6 +1184,7 @@ describe('IExternalHooksRunnerService integration', () => {
             hooks: createHooks(['onWillCompact']),
           });
           reg.definePartialInstance(IAgentTaskService, {});
+          reg.defineInstance(IFlagService, stubFlag(false));
         },
       });
       ix.set(IExternalHooksRunnerService, stubHookRunner(hookEngine));

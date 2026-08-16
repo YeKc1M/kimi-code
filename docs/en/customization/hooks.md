@@ -46,7 +46,7 @@ All hook rules are written in the `[[hooks]]` array in `~/.kimi-code/config.toml
 | `event` | `string` | Yes | Trigger event name; must be one of the entries in the "Event Reference" table below |
 | `matcher` | `string` | No | A regular expression to filter event targets; if omitted, matches all |
 | `command` | `string` | Yes | The shell command to run when triggered |
-| `timeout` | `integer` | No | Timeout in seconds, range 1–600; defaults to 30 seconds |
+| `timeout` | `integer` | No | Timeout in seconds, range 1–86400; defaults to 30 seconds |
 
 `[[hooks]]` only allows these four fields; extra fields will cause the config file to fail to load.
 
@@ -93,7 +93,7 @@ You can also return a JSON object via stdout to block:
 ```
 
 ::: info Which events support blocking?
-Only **blockable events** (`PreToolUse`, `Stop`, `UserPromptSubmit`) have return values that affect the main flow. All other events are **observation-only events** — they fire and forget; the main flow is unaffected regardless of what the script returns.
+Only **blockable events** (`PreToolUse`, `Stop`, `UserPromptSubmit`) have return values that affect the main flow. All other events are **observation-only events** — they fire and forget; the main flow is unaffected regardless of what the script returns. One exception: with the experimental `hook_permission_decisions` flag enabled, [`PermissionRequest`](#deciding-approvals-from-a-hook-experimental) hooks can approve or deny the pending approval request.
 :::
 
 ## Event Reference
@@ -107,7 +107,7 @@ Only **blockable events** (`PreToolUse`, `Stop`, `UserPromptSubmit`) have return
 | `TurnStarted` | Turn origin kind (e.g. `user`, `task`, `system_trigger`) | — | Triggered when a new turn begins; the payload includes `turn_id`, `origin_kind`, `origin_name`, and `prompt` (observation only) |
 | `PostToolUse` | Tool name | — | Triggered after a tool executes successfully (observation only) |
 | `PostToolUseFailure` | Tool name | — | Triggered after a tool fails or is blocked (observation only) |
-| `PermissionRequest` | Tool name | — | Triggered just before waiting for user approval (observation only) |
+| `PermissionRequest` | Tool name | ✓ (experimental) | Triggered just before waiting for user approval; observation-only unless the [`hook_permission_decisions` flag](#deciding-approvals-from-a-hook-experimental) is enabled |
 | `PermissionResult` | Tool name | — | Triggered after approval completes (observation only) |
 | `SessionStart` | `startup` or `resume` | — | Triggered after a new session starts or a previous session resumes; the payload includes `source`, `model`, and `profile` |
 | `SessionEnd` | `exit` or `archive` | — | Triggered after a session closes; `archive` means the session was archived rather than exited |
@@ -120,6 +120,48 @@ Only **blockable events** (`PreToolUse`, `Stop`, `UserPromptSubmit`) have return
 | `PreCompact` | `manual` or `auto` | — | Triggered before context compaction begins; return values are completely ignored |
 | `PostCompact` | `manual` or `auto` | — | Triggered after context compaction completes (observation only) |
 | `Notification` | Notification type (e.g. `task.completed`) | — | Triggered when a background task status changes (observation only) |
+
+## Deciding approvals from a hook (experimental)
+
+By default, `PermissionRequest` is observation-only: it fires just before the CLI starts waiting for your approval, and the script's return value is ignored. Enabling the experimental `hook_permission_decisions` flag turns it into a decision point — the CLI runs the matching hooks first and waits for them, and a hook may answer the approval request itself.
+
+Enable it through the `[experimental]` section in `config.toml` or an environment variable:
+
+```toml
+[experimental]
+hook_permission_decisions = true
+```
+
+```sh
+export KIMI_CODE_EXPERIMENTAL_HOOK_PERMISSION_DECISIONS=1
+```
+
+In addition to the [base event fields](#event-data-format), the hook receives the pending approval's details on stdin:
+
+| Field | Description |
+| --- | --- |
+| `tool_name` | Name of the tool awaiting approval; also the value `matcher` filters on |
+| `tool_input` | The tool call's arguments |
+| `action` | Human-readable summary of what is being approved |
+| `display` | Structured display payload for the approval UI (for a plan review, the plan text is in `display.plan`) |
+| `id` / `session_id` / `agent_id` / `turn_id` / `tool_call_id` | Identifiers for the request and its context |
+
+The script answers through the JSON stdout contract — `permissionDecision: "allow"` approves the tool call, while `"deny"` rejects it and `permissionDecisionReason` is fed back to the model:
+
+```json
+{
+  "hookSpecificOutput": {
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "Add a rollback step to the plan"
+  }
+}
+```
+
+Any other outcome — no JSON output, an unrecognized value, a non-zero exit code, a timeout, or a crash — falls back to the normal approval prompt (fail-open). When several hooks match, a single `deny` wins over any `allow`. Decision hooks often wait on interactive review, so the `timeout` field accepts up to 86400 seconds (24 hours); the default stays 30 seconds.
+
+::: warning Note
+With this flag enabled, a matching hook approves or rejects tool calls **in your place**, without showing the approval prompt. Only enable it with hook commands you fully trust.
+:::
 
 ## Example: Blocking Dangerous Shell Commands
 

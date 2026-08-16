@@ -19,6 +19,9 @@
  * (`stopHookContinuationUsed`, the Stop-hook re-entry guard) is registered
  * into `agentState` (`IAgentStateService`) and read/written through it; the
  * hook listener registrations stay ordinary disposables on the instance.
+ * When the `hook_permission_decisions` flag (resolved through `flag`) is on,
+ * the `PermissionRequest` observation listener stays silent because the
+ * approval layer runs those hooks itself as a blocking decision round.
  */
 
 import { IInstantiationService } from '#/_base/di/instantiation';
@@ -44,6 +47,7 @@ import {
 } from '#/agent/prompt/prompt';
 import type { TurnEndedEvent, TurnStartedEvent } from '#/agent/loop/turnEvents';
 import { IEventBus } from '#/app/event/eventBus';
+import { IFlagService } from '#/app/flag/flag';
 import type { ExecutableToolResult } from '#/tool/toolContract';
 import type { ResolvedToolExecutionHookContext, ToolDidExecuteContext } from '#/agent/toolExecutor/toolHooks';
 import { denyToolExecution } from '#/agent/toolExecutor/beforeToolExecuteEvent';
@@ -53,6 +57,7 @@ import { ISessionContext } from '#/session/sessionContext/sessionContext';
 import { ISessionMetadata } from '#/session/sessionMetadata/sessionMetadata';
 
 import { IAgentExternalHooksService } from './externalHooks';
+import { HOOK_PERMISSION_DECISIONS_FLAG_ID } from './flag';
 import { IExternalHooksRunnerService } from '#/app/externalHooksRunner/externalHooksRunner';
 import type { HookMatcherValue } from './types';
 import {
@@ -90,6 +95,7 @@ export class AgentExternalHooksService extends Service implements IAgentExternal
     @ISessionContext private readonly sessionContext: ISessionContext,
     @ISessionMetadata private readonly sessionMetadata: ISessionMetadata,
     @IAgentStateService private readonly states: IAgentStateService,
+    @IFlagService private readonly flags: IFlagService,
   ) {
     super();
     this.states.register(externalHooksStopHookContinuationUsedKey);
@@ -189,6 +195,7 @@ export class AgentExternalHooksService extends Service implements IAgentExternal
   private registerPermissionHooks(): void {
     this._register(
       this.eventBus.subscribe('permission.approval.requested', (e) => {
+        if (this.flags.enabled(HOOK_PERMISSION_DECISIONS_FLAG_ID)) return;
         const { type: _type, ...inputData } = e;
         this.fireAndForget('PermissionRequest', inputData, e.toolName);
       }),
