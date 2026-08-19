@@ -1,14 +1,3 @@
-/**
- * `skill` domain — user-slash skill activation contract.
- *
- * `SkillActivationInput` carries the slash name and raw args, plus optional
- * edge-resolved attachment parts (`content`) that the activation appends after
- * the rendered skill prompt in its user message. `IAgentSkillService`
- * delivers activations (`activate` — steered into the running turn when busy,
- * launched as a fresh turn when idle) and records model-tool activations
- * without a turn (`recordModelToolActivation`). Bound at Agent scope.
- */
-
 import { createDecorator } from "#/_base/di/instantiation";
 import type { SkillActivationOrigin } from '#/agent/contextMemory/types';
 import type { PromptLaunchResult } from '#/agent/prompt/prompt';
@@ -20,10 +9,28 @@ export interface SkillActivationInput {
   readonly content?: readonly ContentPart[];
 }
 
+export interface PromptSkillActivation {
+  readonly name: string;
+  readonly args?: string;
+}
+
+export interface PromptWithSkillsInput {
+  readonly input: readonly ContentPart[];
+  readonly skills: readonly PromptSkillActivation[];
+}
+
+export interface PromptWithSkillsResult {
+  readonly turn_id?: number;
+  readonly prompt_id: string;
+  readonly created_at: string;
+  readonly state: 'running' | 'queued' | 'blocked';
+}
+
 export interface IAgentSkillService {
   readonly _serviceBrand: undefined;
 
   activate(input: SkillActivationInput): Promise<PromptLaunchResult>;
+  promptWithSkills(input: PromptWithSkillsInput): Promise<PromptWithSkillsResult>;
   recordModelToolActivation(origin: SkillActivationOrigin): void;
 }
 
