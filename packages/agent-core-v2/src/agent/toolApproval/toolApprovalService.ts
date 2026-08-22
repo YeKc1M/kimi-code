@@ -1,20 +1,4 @@
 /* oxlint-disable typescript-eslint/no-unsafe-declaration-merging, eslint-plugin-import/namespace -- Event2 class+payload-interface declaration merging is the sanctioned event-declaration idiom. */
-/**
- * `toolApproval` domain — `IAgentToolApprovalService` implementation.
- *
- * Owns the approval round-trip: dispatches
- * `permission.approval.requested/resolved` as Event2 records through
- * `dispatcher`, awaits the session approval broker (absent broker =
- * auto-approve), records session-scope approval rules through
- * `permissionRules`, reports `permission_approval_result` through
- * `telemetry`, and folds ask continuations back into authorize results.
- * Behind the `hook_permission_decisions` flag (resolved through `flag`),
- * matching `PermissionRequest` hooks run first through
- * `externalHooksRunner` and an explicit allow/deny decision replaces the
- * broker round-trip. The interaction id is minted here (`approval_<uuid>`)
- * so the broker, the events, and the activity view all key the same
- * request. Bound at Agent scope.
- */
 import { randomUUID } from 'node:crypto';
 
 import { IInstantiationService } from '#/_base/di/instantiation';
@@ -22,8 +6,8 @@ import { Service } from '#/_base/di/service';
 import { LifecycleScope } from '#/app/scopes';
 import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import { abortable, isUserCancellation } from '#/_base/utils/abort';
-import { HOOK_PERMISSION_DECISIONS_FLAG_ID } from '#/agent/externalHooks/flag';
-import type { HookResult } from '#/agent/externalHooks/types';
+import { HOOK_PERMISSION_DECISIONS_FLAG_ID } from '#/features/externalHooks/internal/flag';
+import type { HookResult } from '#/features/externalHooks/internal/types';
 import { IAgentPermissionModeService } from '#/agent/permissionMode/permissionMode';
 import type {
   ApprovalResponse,
@@ -37,9 +21,9 @@ import type {
   BeforeExecuteDecision,
   ResolvedToolExecutionHookContext,
 } from '#/agent/toolExecutor/toolHooks';
-import { Event2 } from '#/app/event/event2';
-import { IExternalHooksRunnerService } from '#/app/externalHooksRunner/externalHooksRunner';
-import { permissionDecisionFromResults } from '#/app/externalHooksRunner/runner';
+import { AgentEvent2 } from '#/app/event/event2';
+import { IExternalHooksRunnerService } from '#/features/externalHooks/app/externalHooksRunner';
+import { permissionDecisionFromResults } from '#/features/externalHooks/internal/matchHooks';
 import { IFlagService } from '#/app/flag/flag';
 import { ITelemetryService } from '#/app/telemetry/telemetry';
 import { ISessionApprovalService } from '#/session/approval/approval';
@@ -52,7 +36,7 @@ import { IAgentToolApprovalService } from './toolApproval';
 export interface PermissionApprovalRequestedPayload {
   readonly id?: string;
   readonly sessionId?: string;
-  readonly agentId?: string;
+  readonly agentId: string;
   readonly turnId: number;
   readonly toolCallId: string;
   readonly toolName: string;
@@ -61,7 +45,7 @@ export interface PermissionApprovalRequestedPayload {
   readonly toolInput: unknown;
 }
 
-export class PermissionApprovalRequested extends Event2<PermissionApprovalRequestedPayload> {
+export class PermissionApprovalRequested extends AgentEvent2<PermissionApprovalRequestedPayload> {
   static override readonly type = 'permission.approval.requested';
   static override readonly observable = true;
 }
@@ -75,7 +59,7 @@ export interface PermissionApprovalResolvedPayload extends PermissionApprovalReq
   readonly error?: string;
 }
 
-export class PermissionApprovalResolved extends Event2<PermissionApprovalResolvedPayload> {
+export class PermissionApprovalResolved extends AgentEvent2<PermissionApprovalResolvedPayload> {
   static override readonly type = 'permission.approval.resolved';
   static override readonly observable = true;
 }

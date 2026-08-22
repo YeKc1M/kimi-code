@@ -4,8 +4,8 @@ import { DisposableStore } from '#/_base/di/lifecycle';
 import { createServices } from '#/_base/di/test';
 import type { TestInstantiationService } from '#/_base/di/test';
 import { UserCancellationError } from '#/_base/utils/abort';
-import { HOOK_PERMISSION_DECISIONS_FLAG_ID } from '#/agent/externalHooks/flag';
-import type { HookResult } from '#/agent/externalHooks/types';
+import { HOOK_PERMISSION_DECISIONS_FLAG_ID } from '#/features/externalHooks/internal/flag';
+import type { HookResult } from '#/features/externalHooks/internal/types';
 import type { ResolvedToolExecutionHookContext } from '#/agent/toolExecutor/toolHooks';
 import { IAgentPermissionModeService } from '#/agent/permissionMode/permissionMode';
 import type {
@@ -29,7 +29,7 @@ import type { Event2 } from '#/app/event/event2';
 import {
   IExternalHooksRunnerService,
   type ExternalHooksRunnerTriggerArgs,
-} from '#/app/externalHooksRunner/externalHooksRunner';
+} from '#/features/externalHooks/app/externalHooksRunner';
 import { IFlagService } from '#/app/flag/flag';
 import { ITelemetryService } from '#/app/telemetry/telemetry';
 import { OrderedHookSlot } from '#/hooks';
@@ -142,7 +142,7 @@ describe('AgentToolApprovalService', () => {
           _serviceBrand: undefined,
           hooks: { onDidRestore: new OrderedHookSlot() },
           dispatch: async (event: Event2) => {
-            eventBus.publish(event);
+            eventBus.publish(event, ix.get(IAgentScopeContext).agentContext);
           },
         } as unknown as IEventDispatcher;
         reg.defineInstance(IEventDispatcher, dispatcher);
@@ -158,6 +158,7 @@ describe('AgentToolApprovalService', () => {
       },
       strict: true,
     });
+    (eventBus as EventBusService).activateAgent(ix.get(IAgentScopeContext).agentContext);
   });
   afterEach(() => {
     disposables.dispose();
@@ -197,6 +198,7 @@ describe('AgentToolApprovalService', () => {
       IAgentScopeContext,
       makeAgentScopeContext({ agentId: 'sub-1', agentScope: 'sub-1' }),
     );
+    (eventBus as EventBusService).activateAgent(ix.get(IAgentScopeContext).agentContext);
   }
 
   describe('resolvePermissionResolution', () => {

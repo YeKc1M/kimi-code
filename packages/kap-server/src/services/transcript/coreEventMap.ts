@@ -1,13 +1,13 @@
 import type { AgentActivityUpdated } from '@moonshot-ai/agent-core-v2/agent/activityView/activityView';
 import type { ContextSpliced } from '@moonshot-ai/agent-core-v2/agent/contextMemory/contextEvents';
-import type { HookResult } from '@moonshot-ai/agent-core-v2/agent/externalHooks/externalHooksService';
+import type { HookResult } from '@moonshot-ai/agent-core-v2/features/externalHooks/agent/agentExternalHooksService';
 import type {
   CompactionBlocked,
   CompactionCancelled,
   CompactionCompleted,
   CompactionStarted,
 } from '@moonshot-ai/agent-core-v2/agent/fullCompaction/compactionOps';
-import type { GoalUpdated } from '@moonshot-ai/agent-core-v2/agent/goal/goalOps';
+import type { GoalUpdated } from '@moonshot-ai/agent-core-v2';
 import type {
   AssistantDelta,
   ThinkingDelta,
@@ -211,6 +211,40 @@ export class AgentTranscriptProjector {
   private readonly tasks = new Map<string, TranscriptTask>();
   /** shell `commandId` → transcript `taskId` (`shell.output` is keyed by command id only). */
   private readonly shellTasks = new Map<string, string>();
+  /** subagent agent id → registered task id, for Agent-tool runs whose spawned
+      carried the registration (`taskId`): the task row keys by the task id so
+      `/tasks/{id}` actions resolve, and lifecycle events fold back to it. */
+  private readonly subagentTaskIds = new Map<string, string>();
+
+  /** Pre-seed the association and the row for a task registered before
+      attach: a foreground Agent run emits no `task.started` at all, so
+      without this a late-bound projector never learns the mapping, shows no
+      cancellable row, and lets the terminal event invent foreground-wrong
+      defaults. Only in-flight tasks seed (a terminal one has no lifecycle
+      left to fold). */
+  seedSubagentTask(info: {
+    readonly taskId: string;
+    readonly agentId: string;
+    readonly description: string;
+    readonly status: string;
+    readonly detached: boolean;
+    readonly startedAt: number;
+  }): TranscriptOperation[] {
+    if (info.status !== 'running') return [];
+    this.subagentTaskIds.set(info.agentId, info.taskId);
+    const task = this.upsertTask(info.taskId, (prev) => ({
+      taskId: info.taskId,
+      kind: 'subagent',
+      state: 'running',
+      detached: info.detached,
+      description: info.description,
+      agentId: info.agentId,
+      outputTail: prev?.outputTail ?? '',
+      startedAt: prev?.startedAt ?? epochMsToIso(info.startedAt),
+      endedAt: prev?.endedAt,
+    }));
+    return [{ op: 'task.upsert', task }];
+  }
   /** interaction id → the pending entity as last emitted (resolve spreads it). */
   private readonly interactions = new Map<string, TranscriptInteraction>();
   /** promptId → the prompt queue entity as last emitted (`prompt.upsert` replaces). */
@@ -871,9 +905,16 @@ export class AgentTranscriptProjector {
       outputTail: prev?.outputTail ?? '',
       startedAt: prev?.startedAt ?? epochMsToIso(info.startedAt),
       endedAt: info.endedAt === null ? prev?.endedAt : epochMsToIso(info.endedAt),
+      resultSummary: prev?.resultSummary,
+      usage: prev?.usage,
+      error: prev?.error,
+      stateReason: prev?.stateReason,
     }));
     const ops: TranscriptOperation[] = [{ op: 'task.upsert', task }];
     if (event.type === 'task.started') {
+      if (info.kind === 'agent' && typeof info.agentId === 'string' && info.agentId.length > 0) {
+        this.subagentTaskIds.set(info.agentId, info.taskId);
+      }
       ops.push({
         op: 'taskref.upsert',
         item: { kind: 'taskref', refId: `ref-${info.taskId}`, taskId: info.taskId, at: nowIso() },
@@ -1004,9 +1045,16 @@ export class AgentTranscriptProjector {
     description?: string;
     swarmIndex?: number;
     runInBackground: boolean;
+    taskId?: string;
   }): TranscriptOperation[] {
-    const task = this.upsertTask(event.subagentId, (prev) => ({
-      taskId: event.subagentId,
+    const taskKey = event.taskId ?? event.subagentId;
+    if (event.taskId !== undefined) {
+      this.subagentTaskIds.set(event.subagentId, event.taskId);
+    } else {
+      this.subagentTaskIds.delete(event.subagentId);
+    }
+    const task = this.upsertTask(taskKey, (prev) => ({
+      taskId: taskKey,
       kind: 'subagent',
       state: 'running',
       detached: event.runInBackground,
@@ -1048,8 +1096,9 @@ export class AgentTranscriptProjector {
         : event.type === 'subagent.failed'
           ? 'failed'
           : 'running';
-    const task = this.upsertTask(event.subagentId, (prev) => ({
-      taskId: event.subagentId,
+    const taskKey = this.subagentTaskIds.get(event.subagentId) ?? event.subagentId;
+    const task = this.upsertTask(taskKey, (prev) => ({
+      taskId: taskKey,
       kind: 'subagent',
       state,
       detached: prev?.detached ?? true,
@@ -1081,7 +1130,9 @@ export class AgentTranscriptProjector {
   }): TranscriptOperation[] {
     const ops: TranscriptOperation[] = [];
     const snapshot = event.snapshot;
-    if (snapshot !== null) {
+    if (snapshot === null) {
+      ops.push({ op: 'meta.merge', meta: { goal: null } });
+    } else {
       ops.push({
         op: 'meta.merge',
         meta: {
@@ -1102,6 +1153,7 @@ export class AgentTranscriptProjector {
   private onAgentStatusUpdated(event: {
     planMode?: boolean;
     swarmMode?: boolean;
+    towerMode?: boolean;
     model?: string;
     thinkingEffort?: string;
     usage?: AgentUsageMeta;
@@ -1111,7 +1163,11 @@ export class AgentTranscriptProjector {
     permission?: 'manual' | 'yolo' | 'auto';
   }): TranscriptOperation[] {
     const ops: TranscriptOperation[] = [];
-    const modes: { plan?: Record<string, never> | null; swarm?: Record<string, never> | null } = {};
+    const modes: {
+      plan?: Record<string, never> | null;
+      swarm?: Record<string, never> | null;
+      tower?: Record<string, never> | null;
+    } = {};
     if (event.planMode === true) {
       modes.plan = {};
       this.planModeActive = true;
@@ -1121,7 +1177,9 @@ export class AgentTranscriptProjector {
     }
     if (event.swarmMode === true) modes.swarm = {};
     else if (event.swarmMode === false) modes.swarm = null;
-    if (modes.plan !== undefined || modes.swarm !== undefined) {
+    if (event.towerMode === true) modes.tower = {};
+    else if (event.towerMode === false) modes.tower = null;
+    if (modes.plan !== undefined || modes.swarm !== undefined || modes.tower !== undefined) {
       ops.push({ op: 'meta.merge', meta: { modes } });
     }
     const agent: {
