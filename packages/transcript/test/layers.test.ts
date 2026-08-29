@@ -443,6 +443,293 @@ describe('groupMessagesIntoSnapshot (cold path)', () => {
     expect(marker?.kind === 'marker' && marker.marker).toBe('compaction');
   });
 
+  it('folds task-notification user messages into the current turn instead of opening their own', () => {
+    const snapshot = groupMessagesIntoSnapshot(
+      [
+      { role: 'user', content: [{ type: 'text', text: 'run it' }], toolCalls: [], origin: { kind: 'user' } },
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'starting' }],
+        toolCalls: [{ id: 'c1', name: 'Bash', arguments: '{"command":"ls"}' }],
+      },
+      {
+        role: 'user',
+        content: [{
+          type: 'text',
+          text: '<notification id="task:task-9:completed" category="task" type="task.completed" source_kind="background_task" source_id="task-9">\nTitle: Background agent completed\nSeverity: info\ninspect done.\n</notification>',
+        }],
+        toolCalls: [],
+        origin: { kind: 'task', taskId: 'task-9' } as { kind: string },
+      },
+      {
+        role: 'user',
+        content: [{ type: 'text', text: '<notification id="task:task-8:completed"></notification>' }],
+        toolCalls: [],
+        origin: { kind: 'task', taskId: 'task-8' } as { kind: string },
+      },
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'continuing' }],
+        toolCalls: [],
+      },
+      ],
+      { taskOriginTurnTaskIds: new Set() },
+    );
+
+    const turns = snapshot.items.filter((i) => i.kind === 'turn');
+    expect(turns).toHaveLength(1);
+    const turn = turns[0];
+    if (turn?.kind !== 'turn') throw new Error('expected turn');
+    const userFrames = turn.steps
+      .flatMap((step) => step.frames)
+      .filter((f) => f.kind === 'text' && f.role === 'user');
+    expect(userFrames.map((f) => f.kind === 'text' && f.taskId)).toEqual(['task-9', 'task-8']);
+    expect(userFrames[0]).toMatchObject({ text: 'Background agent completed\ninspect done.' });
+    const assistantTexts = turn.steps
+      .flatMap((step) => step.frames)
+      .filter((f) => f.kind === 'text' && f.role === 'assistant')
+      .map((f) => f.kind === 'text' && f.text);
+    expect(assistantTexts).toEqual(['starting', 'continuing']);
+    expect(turn.steps).toHaveLength(2);
+    expect(turn.steps[1]?.frames.map((f) => f.kind === 'text' && f.role)).toEqual([
+      'user',
+      'user',
+      'assistant',
+    ]);
+  });
+
+  it('folds a user message whose content matches a turn.steer record into the current turn as a user frame', () => {
+    const snapshot = groupMessagesIntoSnapshot(
+      [
+        { role: 'user', content: [{ type: 'text', text: 'active' }], toolCalls: [], origin: { kind: 'user' } },
+        { role: 'assistant', content: [{ type: 'text', text: 'working' }], toolCalls: [] },
+        { role: 'user', content: [{ type: 'text', text: 'steered in' }], toolCalls: [], origin: { kind: 'user' } },
+        { role: 'assistant', content: [{ type: 'text', text: 'noted' }], toolCalls: [] },
+      ],
+      { steeredContents: new Map([[JSON.stringify([{ type: 'text', text: 'steered in' }]), new Map([['user', 1]])]]) },
+    );
+
+    expect(snapshot.items.map((i) => i.kind)).toEqual(['turn']);
+    const turn = snapshot.items[0];
+    if (turn?.kind !== 'turn') throw new Error('expected turn');
+    expect(turn.steps).toHaveLength(2);
+    expect(turn.steps[1]?.frames[0]).toMatchObject({
+      kind: 'text',
+      role: 'user',
+      text: 'steered in',
+    });
+  });
+
+  it('keeps a trailing steered message visible by appending it to the last step', () => {
+    const snapshot = groupMessagesIntoSnapshot(
+      [
+        { role: 'user', content: [{ type: 'text', text: 'active' }], toolCalls: [], origin: { kind: 'user' } },
+        { role: 'assistant', content: [{ type: 'text', text: 'working' }], toolCalls: [] },
+        { role: 'user', content: [{ type: 'text', text: 'steered in' }], toolCalls: [], origin: { kind: 'user' } },
+      ],
+      { steeredContents: new Map([[JSON.stringify([{ type: 'text', text: 'steered in' }]), new Map([['user', 1]])]]) },
+    );
+
+    expect(snapshot.items.map((i) => i.kind)).toEqual(['turn']);
+    const turn = snapshot.items[0];
+    if (turn?.kind !== 'turn') throw new Error('expected turn');
+    const lastStep = turn.steps.at(-1);
+    expect(lastStep?.frames.at(-1)).toMatchObject({
+      kind: 'text',
+      role: 'user',
+      text: 'steered in',
+    });
+  });
+
+  it('flushes a pending steer into the closing turn when a new turn opens before any reply', () => {
+    const snapshot = groupMessagesIntoSnapshot(
+      [
+        { role: 'user', content: [{ type: 'text', text: 'active' }], toolCalls: [], origin: { kind: 'user' } },
+        { role: 'assistant', content: [{ type: 'text', text: 'working' }], toolCalls: [] },
+        { role: 'user', content: [{ type: 'text', text: 'steered in' }], toolCalls: [], origin: { kind: 'user' } },
+        { role: 'user', content: [{ type: 'text', text: 'next question' }], toolCalls: [], origin: { kind: 'user' } },
+        { role: 'assistant', content: [{ type: 'text', text: 'answer' }], toolCalls: [] },
+      ],
+      { steeredContents: new Map([[JSON.stringify([{ type: 'text', text: 'steered in' }]), new Map([['user', 1]])]]) },
+    );
+
+    const turns = snapshot.items.filter((i) => i.kind === 'turn');
+    expect(turns).toHaveLength(2);
+    const first = turns[0];
+    if (first?.kind !== 'turn') throw new Error('expected turn');
+    expect(first.steps.at(-1)?.frames.at(-1)).toMatchObject({
+      kind: 'text',
+      role: 'user',
+      text: 'steered in',
+    });
+    const second = turns[1];
+    if (second?.kind !== 'turn') throw new Error('expected turn');
+    expect(second.prompt).toBe('next question');
+  });
+
+  it('still opens its own turn for a mid-conversation user message unknown to the steer map', () => {
+    const snapshot = groupMessagesIntoSnapshot(
+      [
+        { role: 'user', content: [{ type: 'text', text: 'active' }], toolCalls: [], origin: { kind: 'user' } },
+        { role: 'assistant', content: [{ type: 'text', text: 'working' }], toolCalls: [] },
+        { role: 'user', content: [{ type: 'text', text: 'plain follow-up' }], toolCalls: [], origin: { kind: 'user' } },
+      ],
+      { steeredContents: new Map([[JSON.stringify([{ type: 'text', text: 'steered in' }]), new Map([['user', 1]])]]) },
+    );
+
+    expect(snapshot.items.map((i) => i.kind)).toEqual(['turn', 'turn']);
+  });
+
+  it('stops folded notification text before child output blocks', () => {
+    const xml = [
+      '<notification id="task:task-9:completed" category="task" type="task.completed" source_kind="background_task" source_id="task-9">',
+      'Title: Background agent completed',
+      'Severity: info',
+      'inspect done.',
+      '<output-file>/tmp/out.log</output-file>',
+      '/tmp/out.log',
+      'full output here',
+      '</notification>',
+    ].join('\n');
+    const snapshot = groupMessagesIntoSnapshot(
+      [
+        { role: 'user', content: [{ type: 'text', text: 'run' }], toolCalls: [], origin: { kind: 'user' } },
+        { role: 'assistant', content: [{ type: 'text', text: 'go' }], toolCalls: [] },
+        { role: 'user', content: [{ type: 'text', text: xml }], toolCalls: [], origin: { kind: 'task', taskId: 'task-9' } as { kind: string } },
+        { role: 'assistant', content: [{ type: 'text', text: 'done' }], toolCalls: [] },
+      ],
+      { taskOriginTurnTaskIds: new Set() },
+    );
+    const turn = snapshot.items[0];
+    if (turn?.kind !== 'turn') throw new Error('expected turn');
+    const frame = turn.steps.flatMap((step) => step.frames).find((f) => f.kind === 'text' && f.role === 'user');
+    expect(frame).toMatchObject({ text: 'Background agent completed\ninspect done.' });
+  });
+
+  it('buffers a folded notification that arrives before the first step into that step', () => {
+    const xml = [
+      '<notification id="task:task-9:completed" category="task" type="task.completed" source_kind="background_task" source_id="task-9">',
+      'Title: Background agent completed',
+      'Severity: info',
+      'early done.',
+      '</notification>',
+    ].join('\n');
+    const snapshot = groupMessagesIntoSnapshot(
+      [
+        { role: 'user', content: [{ type: 'text', text: 'run' }], toolCalls: [], origin: { kind: 'user' } },
+        { role: 'user', content: [{ type: 'text', text: xml }], toolCalls: [], origin: { kind: 'task', taskId: 'task-9' } as { kind: string } },
+        { role: 'assistant', content: [{ type: 'text', text: 'go' }], toolCalls: [] },
+      ],
+      { taskOriginTurnTaskIds: new Set() },
+    );
+    const turn = snapshot.items[0];
+    if (turn?.kind !== 'turn') throw new Error('expected turn');
+    expect(turn.steps).toHaveLength(1);
+    expect(turn.steps[0]?.frames.map((f) => f.kind === 'text' && f.role)).toEqual([
+      'user',
+      'assistant',
+    ]);
+    expect(turn.steps[0]?.frames[0]).toMatchObject({
+      text: 'Background agent completed\nearly done.',
+      taskId: 'task-9',
+    });
+  });
+
+  it('drops a folded notification when no turn is open yet', () => {
+    const snapshot = groupMessagesIntoSnapshot(
+      [
+        {
+          role: 'user',
+          content: [{ type: 'text', text: '<notification id="n1"></notification>' }],
+          toolCalls: [],
+          origin: { kind: 'task', taskId: 'task-9' } as { kind: string },
+        },
+      ],
+      { taskOriginTurnTaskIds: new Set() },
+    );
+    expect(snapshot.items).toHaveLength(0);
+  });
+
+  it('keeps body lines that start with an angle bracket but are not output blocks', () => {
+    const xml = [
+      '<notification id="task:task-9:completed" category="task" type="task.completed" source_kind="background_task" source_id="task-9">',
+      'Title: Background agent completed',
+      'Severity: info',
+      'first line.',
+      '<div>pasted markup</div>',
+      'last line.',
+      '</notification>',
+    ].join('\n');
+    const snapshot = groupMessagesIntoSnapshot(
+      [
+        { role: 'user', content: [{ type: 'text', text: 'run' }], toolCalls: [], origin: { kind: 'user' } },
+        { role: 'assistant', content: [{ type: 'text', text: 'go' }], toolCalls: [] },
+        { role: 'user', content: [{ type: 'text', text: xml }], toolCalls: [], origin: { kind: 'task', taskId: 'task-9' } as { kind: string } },
+        { role: 'assistant', content: [{ type: 'text', text: 'done' }], toolCalls: [] },
+      ],
+      { taskOriginTurnTaskIds: new Set() },
+    );
+    const turn = snapshot.items[0];
+    if (turn?.kind !== 'turn') throw new Error('expected turn');
+    const frame = turn.steps.flatMap((step) => step.frames).find((f) => f.kind === 'text' && f.role === 'user');
+    expect(frame).toMatchObject({
+      text: 'Background agent completed\nfirst line.\n<div>pasted markup</div>\nlast line.',
+    });
+  });
+
+  it('parses only the leading header lines, keeping later Title-like lines as body', () => {
+    const xml = [
+      '<notification id="task:task-9:completed" category="task" type="task.completed" source_kind="background_task" source_id="task-9">',
+      'Title: Background agent completed',
+      'Severity: info',
+      'first line.',
+      'Title: details',
+      'last line.',
+      '</notification>',
+    ].join('\n');
+    const snapshot = groupMessagesIntoSnapshot(
+      [
+        { role: 'user', content: [{ type: 'text', text: 'run' }], toolCalls: [], origin: { kind: 'user' } },
+        { role: 'assistant', content: [{ type: 'text', text: 'go' }], toolCalls: [] },
+        { role: 'user', content: [{ type: 'text', text: xml }], toolCalls: [], origin: { kind: 'task', taskId: 'task-9' } as { kind: string } },
+        { role: 'assistant', content: [{ type: 'text', text: 'done' }], toolCalls: [] },
+      ],
+      { taskOriginTurnTaskIds: new Set() },
+    );
+    const turn = snapshot.items[0];
+    if (turn?.kind !== 'turn') throw new Error('expected turn');
+    const frame = turn.steps.flatMap((step) => step.frames).find((f) => f.kind === 'text' && f.role === 'user');
+    expect(frame).toMatchObject({
+      text: 'Background agent completed\nfirst line.\nTitle: details\nlast line.',
+    });
+  });
+
+  it('keeps a body whose first line starts with Severity:', () => {
+    const xml = [
+      '<notification id="task:task-9:completed" category="task" type="task.completed" source_kind="background_task" source_id="task-9">',
+      'Title: Background agent completed',
+      'Severity: info',
+      'Severity: this line is the task description, not a header',
+      'last line.',
+      '</notification>',
+    ].join('\n');
+    const snapshot = groupMessagesIntoSnapshot(
+      [
+        { role: 'user', content: [{ type: 'text', text: 'run' }], toolCalls: [], origin: { kind: 'user' } },
+        { role: 'assistant', content: [{ type: 'text', text: 'go' }], toolCalls: [] },
+        { role: 'user', content: [{ type: 'text', text: xml }], toolCalls: [], origin: { kind: 'task', taskId: 'task-9' } as { kind: string } },
+        { role: 'assistant', content: [{ type: 'text', text: 'done' }], toolCalls: [] },
+      ],
+      { taskOriginTurnTaskIds: new Set() },
+    );
+    const turn = snapshot.items[0];
+    if (turn?.kind !== 'turn') throw new Error('expected turn');
+    const frame = turn.steps.flatMap((step) => step.frames).find((f) => f.kind === 'text' && f.role === 'user');
+    expect(frame).toMatchObject({
+      text: 'Background agent completed\nSeverity: this line is the task description, not a header\nlast line.',
+    });
+  });
+
   it('expands a bundled prompt into per-skill markers and a caller-text turn', () => {
     const snapshot = groupMessagesIntoSnapshot([
       {
@@ -517,6 +804,77 @@ describe('groupMessagesIntoSnapshot (cold path)', () => {
     const firstTurn = snapshot.items[0];
     if (firstTurn?.kind !== 'turn') throw new Error('expected turn');
     expect(firstTurn.attachmentIds).toEqual(['att_1', 'att_2', 'att_3']);
+  });
+
+  it('folds origin file attachments on the opening user message into path-sourced entities', () => {
+    const snapshot = groupMessagesIntoSnapshot([
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: 'Attached file "report.pdf" (application/pdf, 128 bytes): /data/report.pdf — open it with the Read tool',
+          },
+        ],
+        toolCalls: [],
+        origin: {
+          kind: 'user',
+          attachments: [
+            { name: 'report.pdf', mediaType: 'application/pdf', size: 128, path: '/data/report.pdf' },
+          ],
+        } as { kind: string },
+      },
+      { role: 'assistant', content: [{ type: 'text', text: 'done' }], toolCalls: [] },
+    ]);
+
+    expect(snapshot.attachments).toEqual([
+      {
+        attachmentId: 'att_1',
+        mediaType: 'application/pdf',
+        name: 'report.pdf',
+        size: 128,
+      },
+    ]);
+    const turn = snapshot.items[0];
+    if (turn?.kind !== 'turn') throw new Error('expected turn');
+    expect(turn.attachmentIds).toEqual(['att_1']);
+  });
+
+  it('folds origin file attachments on a skill activation message into path-sourced entities', () => {
+    const snapshot = groupMessagesIntoSnapshot([
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: 'User activated the skill "update-config".',
+          },
+        ],
+        toolCalls: [],
+        origin: {
+          kind: 'skill_activation',
+          activationId: 'act_1',
+          skillName: 'update-config',
+          trigger: 'user-slash',
+          attachments: [
+            { name: 'note.txt', mediaType: 'text/plain', size: 21, path: '/data/note.txt' },
+          ],
+        } as { kind: string },
+      },
+      { role: 'assistant', content: [{ type: 'text', text: 'done' }], toolCalls: [] },
+    ]);
+
+    expect(snapshot.attachments).toEqual([
+      {
+        attachmentId: 'att_1',
+        mediaType: 'text/plain',
+        name: 'note.txt',
+        size: 21,
+      },
+    ]);
+    const turn = snapshot.items[1];
+    if (turn?.kind !== 'turn') throw new Error('expected turn');
+    expect(turn.attachmentIds).toEqual(['att_1']);
   });
 
   it('maps persisted kimi-file media refs to attachments', () => {
@@ -704,7 +1062,7 @@ describe('groupMessagesIntoSnapshot (cold path)', () => {
     if (subTurn?.kind !== 'turn') throw new Error('expected turn');
     expect(subTurn.ordinal).toBe(1);
     expect(subTurn.origin.kind).toBe('other');
-    expect(subTurn.prompt).toBeUndefined();
+    expect(subTurn.prompt).toBe('scan the repo');
     expect(subTurn.steps).toHaveLength(1);
   });
 
@@ -739,6 +1097,139 @@ describe('groupMessagesIntoSnapshot (cold path)', () => {
     expect(slashTurn.origin.kind).toBe('other');
     expect(slashTurn.prompt).toBe('skill body');
     expect(slashTurn.steps).toHaveLength(2);
+  });
+
+  it('keeps model-tool skill activations as markers even when their content matches a steer record', () => {
+    const skillContent = [{ type: 'text', text: 'skill body' }];
+    const snapshot = groupMessagesIntoSnapshot(
+      [
+        { role: 'user', content: [{ type: 'text', text: 'hi' }], toolCalls: [], origin: { kind: 'user' } },
+        { role: 'assistant', content: [{ type: 'text', text: 'answer' }], toolCalls: [] },
+        {
+          role: 'user',
+          content: skillContent,
+          toolCalls: [],
+          origin: { kind: 'skill_activation', trigger: 'model-tool', skillName: 'write-tui' } as {
+            kind: string;
+          },
+        },
+        { role: 'assistant', content: [{ type: 'text', text: 'used the skill' }], toolCalls: [] },
+      ],
+      { steeredContents: new Map([[JSON.stringify(skillContent), new Map([['skill_activation', 1]])]]) },
+    );
+
+    expect(snapshot.items.map((item) => item.kind)).toEqual(['turn', 'marker']);
+    const marker = snapshot.items[1];
+    if (marker?.kind !== 'marker') throw new Error('expected marker');
+    expect(marker.marker).toBe('skill');
+  });
+
+  it('still folds cron-origin steers into the running turn by content match', () => {
+    const cronContent = [{ type: 'text', text: 'cron tick' }];
+    const snapshot = groupMessagesIntoSnapshot(
+      [
+        { role: 'user', content: [{ type: 'text', text: 'active' }], toolCalls: [], origin: { kind: 'user' } },
+        { role: 'assistant', content: [{ type: 'text', text: 'working' }], toolCalls: [] },
+        {
+          role: 'user',
+          content: cronContent,
+          toolCalls: [],
+          origin: { kind: 'cron_job', jobId: 'job1' } as { kind: string },
+        },
+        { role: 'assistant', content: [{ type: 'text', text: 'noted' }], toolCalls: [] },
+      ],
+      { steeredContents: new Map([[JSON.stringify(cronContent), new Map([['cron_job', 1]])]]) },
+    );
+
+    expect(snapshot.items.map((item) => item.kind)).toEqual(['turn']);
+    const turn = snapshot.items[0];
+    if (turn?.kind !== 'turn') throw new Error('expected turn');
+    expect(turn.steps).toHaveLength(2);
+    expect(turn.steps[1]?.frames[0]).toMatchObject({
+      kind: 'text',
+      role: 'user',
+      text: 'cron tick',
+    });
+  });
+
+  it('still folds user-slash skill activations into the running turn by content match', () => {
+    const slashContent = [{ type: 'text', text: 'slash skill body' }];
+    const snapshot = groupMessagesIntoSnapshot(
+      [
+        { role: 'user', content: [{ type: 'text', text: 'active' }], toolCalls: [], origin: { kind: 'user' } },
+        { role: 'assistant', content: [{ type: 'text', text: 'working' }], toolCalls: [] },
+        {
+          role: 'user',
+          content: slashContent,
+          toolCalls: [],
+          origin: { kind: 'skill_activation', trigger: 'user-slash', skillName: 'gen-docs' } as {
+            kind: string;
+          },
+        },
+        { role: 'assistant', content: [{ type: 'text', text: 'noted' }], toolCalls: [] },
+      ],
+      { steeredContents: new Map([[JSON.stringify(slashContent), new Map([['skill_activation', 1]])]]) },
+    );
+
+    expect(snapshot.items.map((item) => item.kind)).toEqual(['turn']);
+    const turn = snapshot.items[0];
+    if (turn?.kind !== 'turn') throw new Error('expected turn');
+    expect(turn.steps).toHaveLength(2);
+    expect(turn.steps[1]?.frames[0]).toMatchObject({
+      kind: 'text',
+      role: 'user',
+      text: 'slash skill body',
+    });
+  });
+
+  it('consumes the steer count for marker-only activations so a later identical prompt opens its own turn', () => {
+    const shared = [{ type: 'text', text: 'same text' }];
+    const snapshot = groupMessagesIntoSnapshot(
+      [
+        { role: 'user', content: [{ type: 'text', text: 'active' }], toolCalls: [], origin: { kind: 'user' } },
+        { role: 'assistant', content: [{ type: 'text', text: 'working' }], toolCalls: [] },
+        {
+          role: 'user',
+          content: shared,
+          toolCalls: [],
+          origin: { kind: 'skill_activation', trigger: 'model-tool', skillName: 'x' } as {
+            kind: string;
+          },
+        },
+        { role: 'user', content: shared, toolCalls: [], origin: { kind: 'user' } },
+        { role: 'assistant', content: [{ type: 'text', text: 'noted' }], toolCalls: [] },
+      ],
+      { steeredContents: new Map([[JSON.stringify(shared), new Map([['skill_activation', 1]])]]) },
+    );
+
+    expect(snapshot.items.map((item) => item.kind)).toEqual(['turn', 'marker', 'turn']);
+  });
+
+  it('does not consume a user steer count for a compaction summary with identical content', () => {
+    const shared = [{ type: 'text', text: 'same text' }];
+    const snapshot = groupMessagesIntoSnapshot(
+      [
+        { role: 'user', content: [{ type: 'text', text: 'active' }], toolCalls: [], origin: { kind: 'user' } },
+        { role: 'assistant', content: [{ type: 'text', text: 'working' }], toolCalls: [] },
+        {
+          role: 'user',
+          content: shared,
+          toolCalls: [],
+          origin: { kind: 'compaction_summary' } as { kind: string },
+        },
+        { role: 'user', content: shared, toolCalls: [], origin: { kind: 'user' } },
+        { role: 'assistant', content: [{ type: 'text', text: 'noted' }], toolCalls: [] },
+      ],
+      { steeredContents: new Map([[JSON.stringify(shared), new Map([['user', 1]])]]) },
+    );
+
+    expect(snapshot.items.map((item) => item.kind)).toEqual(['turn', 'marker']);
+    const turn = snapshot.items[0];
+    if (turn?.kind !== 'turn') throw new Error('expected turn');
+    const steered = turn.steps
+      .flatMap((step) => step.frames)
+      .filter((frame) => frame.kind === 'text' && frame.role === 'user');
+    expect(steered).toHaveLength(1);
   });
 
   it('starts a promptless turn for turn-opening system triggers (goal continuation)', () => {
@@ -791,6 +1282,30 @@ describe('groupMessagesIntoSnapshot (cold path)', () => {
     expect(snapshot.items).toHaveLength(2);
     const cronTurn = snapshot.items[1];
     expect(cronTurn?.kind === 'turn' && cronTurn.origin.kind).toBe('cron');
+  });
+
+  it('opens a task turn for a notification with a task-origin turn.started in the wire', () => {
+    const snapshot = groupMessagesIntoSnapshot(
+      [
+        { role: 'user', content: [{ type: 'text', text: 'hi' }], toolCalls: [], origin: { kind: 'user' } },
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'answer' }],
+          toolCalls: [],
+        },
+        {
+          role: 'user',
+          content: [{ type: 'text', text: 'task done' }],
+          toolCalls: [],
+          origin: { kind: 'task', taskId: 'task-9' } as { kind: string },
+        },
+      ],
+      { taskOriginTurnTaskIds: new Set(['task-9']) },
+    );
+
+    const taskTurn = snapshot.items[1];
+    if (taskTurn?.kind !== 'turn') throw new Error('expected turn');
+    expect(taskTurn.origin).toMatchObject({ kind: 'task', taskId: 'task-9' });
   });
 
   it('maps legacy background_task origins to task turns, preserving the taskId', () => {
