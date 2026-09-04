@@ -340,6 +340,7 @@ export * from '#/features/externalHooks/session/sessionExternalHooksService';
 export * from '#/features/externalHooks/agent/agentExternalHooks';
 export * from '#/features/externalHooks/agent/agentExternalHooksService';
 import '#/features/externalHooks/externalHooksFeature';
+import '#/features/externalHooks/internal/flag';
 export * from '#/features/debugEvents/debugEvents';
 export * from '#/features/debugEvents/debugEventsService';
 import '#/features/debugEvents/debugEventsFeature';

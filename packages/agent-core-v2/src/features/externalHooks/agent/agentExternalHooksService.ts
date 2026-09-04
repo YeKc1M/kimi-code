@@ -29,6 +29,7 @@ import {
 } from '#/agent/toolApproval/toolApprovalService';
 import { IEventBus } from '#/app/event/eventBus';
 import { AgentEvent2 } from '#/app/event/event2';
+import { IFlagService } from '#/app/flag/flag';
 import type { ExecutableToolResult } from '#/tool/toolContract';
 import type { ResolvedToolExecutionHookContext, ToolDidExecuteContext } from '#/agent/toolExecutor/toolHooks';
 import { denyToolExecution } from '#/agent/toolExecutor/beforeToolExecuteEvent';
@@ -39,6 +40,7 @@ import { ISessionMetadata } from '#/session/sessionMetadata/sessionMetadata';
 import { IEventDispatcher } from '#/state/eventDispatcher';
 
 import { IAgentExternalHooksService } from './agentExternalHooks';
+import { HOOK_PERMISSION_DECISIONS_FLAG_ID } from '../internal/flag';
 import { IExternalHooksRunnerService } from '../app/externalHooksRunner';
 import type { HookMatcherValue } from '../internal/types';
 import {
@@ -78,6 +80,7 @@ export class AgentExternalHooksService extends Service implements IAgentExternal
     @IAgentStateService private readonly states: IAgentStateService,
     @IAgentScopeContext private readonly scopeContext: IAgentScopeContext,
     @IEventDispatcher private readonly dispatcher: IEventDispatcher,
+    @IFlagService private readonly flags: IFlagService,
   ) {
     super();
     this.states.contributeState(externalHooksStopHookContinuationUsedKey);
@@ -177,6 +180,7 @@ export class AgentExternalHooksService extends Service implements IAgentExternal
   private registerPermissionHooks(): void {
     this._register(
       this.eventBus.subscribe(PermissionApprovalRequested, (e) => {
+        if (this.flags.enabled(HOOK_PERMISSION_DECISIONS_FLAG_ID)) return;
         const { type: _type, time: _time, ...inputData } = e;
         this.fireAndForget('PermissionRequest', inputData, e.toolName);
       }),

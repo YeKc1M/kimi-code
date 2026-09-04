@@ -1,6 +1,8 @@
 import { realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 
+import { permissionDecisionFromResults } from '#/features/externalHooks/internal/matchHooks';
+import type { HookResult } from '#/features/externalHooks/internal/types';
 import type { ContentPart } from '#/kosong/contract/message';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -340,5 +342,46 @@ describe('ExternalHooksRunnerService', () => {
     expect(runner.hasHooksFor('PreToolUse')).toBe(true);
     expect(runner.hasHooksFor('SessionHeartbeat')).toBe(true);
     expect(runner.hasHooksFor('Stop')).toBe(false);
+  });
+});
+
+describe('permissionDecisionFromResults', () => {
+  const allowResult: HookResult = { action: 'allow' };
+
+  it('returns undefined for empty results and results without an explicit decision', () => {
+    expect(permissionDecisionFromResults([])).toBeUndefined();
+    expect(permissionDecisionFromResults([allowResult])).toBeUndefined();
+    expect(
+      permissionDecisionFromResults([{ action: 'block', reason: 'exit code 2' }]),
+    ).toBeUndefined();
+  });
+
+  it('aggregates an explicit allow when no hook denies', () => {
+    expect(
+      permissionDecisionFromResults([
+        allowResult,
+        { action: 'allow', permissionDecision: 'allow' },
+      ]),
+    ).toEqual({ decision: 'allow' });
+  });
+
+  it('prefers any deny over allow and carries its reason', () => {
+    expect(
+      permissionDecisionFromResults([
+        { action: 'allow', permissionDecision: 'allow' },
+        { action: 'block', permissionDecision: 'deny', reason: 'not today' },
+      ]),
+    ).toEqual({ decision: 'deny', reason: 'not today' });
+  });
+
+  it('fills a default deny reason when the hook result has none', () => {
+    expect(
+      permissionDecisionFromResults([{ action: 'block', permissionDecision: 'deny' }]),
+    ).toEqual({ decision: 'deny', reason: 'Denied by PermissionRequest hook' });
+    expect(
+      permissionDecisionFromResults([
+        { action: 'block', permissionDecision: 'deny', reason: '   ' },
+      ]),
+    ).toEqual({ decision: 'deny', reason: 'Denied by PermissionRequest hook' });
   });
 });

@@ -4,6 +4,8 @@ import { DisposableStore } from '#/_base/di/lifecycle';
 import { createServices } from '#/_base/di/test';
 import type { TestInstantiationService } from '#/_base/di/test';
 import { UserCancellationError } from '#/_base/utils/abort';
+import { HOOK_PERMISSION_DECISIONS_FLAG_ID } from '#/features/externalHooks/internal/flag';
+import type { HookResult } from '#/features/externalHooks/internal/types';
 import type { ResolvedToolExecutionHookContext } from '#/agent/toolExecutor/toolHooks';
 import { IAgentPermissionModeService } from '#/agent/permissionMode/permissionMode';
 import type {
@@ -24,6 +26,11 @@ import {
 import { IEventBus } from '#/app/event/eventBus';
 import { EventBusService } from '#/app/event/eventBusService';
 import type { Event2 } from '#/app/event/event2';
+import {
+  IExternalHooksRunnerService,
+  type ExternalHooksRunnerTriggerArgs,
+} from '#/features/externalHooks/app/externalHooksRunner';
+import { IFlagService } from '#/app/flag/flag';
 import { ITelemetryService } from '#/app/telemetry/telemetry';
 import { OrderedHookSlot } from '#/hooks';
 import type { ToolCall } from '#/kosong/contract/message';
@@ -90,6 +97,11 @@ describe('AgentToolApprovalService', () => {
   let records: TelemetryRecord[];
   let recorded: PermissionApprovalResultRecord[];
   let eventBus: IEventBus;
+  let hookDecisionFlag: boolean;
+  let hasPermissionHooks: boolean;
+  let hookTrigger: ReturnType<
+    typeof vi.fn<(event: string, args?: ExternalHooksRunnerTriggerArgs) => Promise<HookResult[]>>
+  >;
 
   beforeEach(() => {
     disposables = new DisposableStore();
@@ -97,6 +109,9 @@ describe('AgentToolApprovalService', () => {
     mode = 'manual';
     records = [];
     recorded = [];
+    hookDecisionFlag = false;
+    hasPermissionHooks = false;
+    hookTrigger = vi.fn(async () => [] as HookResult[]);
     ix = createServices(disposables, {
       additionalServices: (reg) => {
         reg.defineInstance(
@@ -131,6 +146,14 @@ describe('AgentToolApprovalService', () => {
           },
         } as unknown as IEventDispatcher;
         reg.defineInstance(IEventDispatcher, dispatcher);
+        reg.definePartialInstance(IExternalHooksRunnerService, {
+          hasHooksFor: (event: string) => event === 'PermissionRequest' && hasPermissionHooks,
+          trigger: (event: string, args?: ExternalHooksRunnerTriggerArgs) =>
+            hookTrigger(event, args),
+        });
+        reg.definePartialInstance(IFlagService, {
+          enabled: (id: string) => id === HOOK_PERMISSION_DECISIONS_FLAG_ID && hookDecisionFlag,
+        });
         reg.define(IAgentToolApprovalService, AgentToolApprovalService);
       },
       strict: true,
@@ -622,6 +645,161 @@ describe('AgentToolApprovalService', () => {
           trace_id: 'trace-approval-1',
         }),
       });
+    });
+
+    it('lets a PermissionRequest hook approve without the broker when the flag is on', async () => {
+      const events = subscribeApprovalEvents();
+      hookDecisionFlag = true;
+      hasPermissionHooks = true;
+      hookTrigger.mockResolvedValue([{ action: 'allow', permissionDecision: 'allow' }]);
+      const request = useBroker(async () => ({ decision: 'rejected' }));
+      const resolveApproval = vi.fn(() => ({
+        kind: 'result' as const,
+        result: { output: 'Plan review handled.' },
+      }));
+      const svc = make();
+
+      await expect(
+        svc.requestToolApproval(
+          makeContext('ExitPlanMode', { plan: '# Plan' }),
+          ask({ resolveApproval }),
+          'exit-plan-mode-review-ask',
+        ),
+      ).resolves.toEqual({
+        veto: { output: 'Plan review handled.' },
+      });
+
+      expect(hookTrigger).toHaveBeenCalledTimes(1);
+      expect(hookTrigger).toHaveBeenCalledWith(
+        'PermissionRequest',
+        expect.objectContaining({
+          matcherValue: 'ExitPlanMode',
+          sessionId: 'test-session',
+          inputData: expect.objectContaining({
+            toolName: 'ExitPlanMode',
+            toolInput: { plan: '# Plan' },
+          }),
+        }),
+      );
+      expect(request).not.toHaveBeenCalled();
+      expect(resolveApproval).toHaveBeenCalledWith({ decision: 'approved' });
+      expect(events.requested).toHaveBeenCalledTimes(1);
+      expect(events.resolved).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'permission.approval.resolved',
+          decision: 'approved',
+        }),
+      );
+    });
+
+    it('lets a PermissionRequest hook deny with feedback when the flag is on', async () => {
+      hookDecisionFlag = true;
+      hasPermissionHooks = true;
+      hookTrigger.mockResolvedValue([
+        { action: 'block', permissionDecision: 'deny', reason: 'needs tests' },
+      ]);
+      const request = useBroker(async () => ({ decision: 'approved' }));
+      const resolveApproval = vi.fn(() => undefined);
+      const svc = make();
+
+      await expect(
+        svc.requestToolApproval(
+          makeContext('Bash'),
+          ask({ resolveApproval }),
+          'fallback-ask',
+        ),
+      ).resolves.toEqual({
+        veto: {
+          output:
+            'Tool "Bash" was not run because the user rejected the approval request.' +
+            ' Reason: needs tests',
+          isError: true,
+        },
+      });
+
+      expect(request).not.toHaveBeenCalled();
+      expect(resolveApproval).toHaveBeenCalledWith({
+        decision: 'rejected',
+        feedback: 'needs tests',
+      });
+      expect(recorded[0]).toMatchObject({
+        result: { decision: 'rejected', feedback: 'needs tests' },
+      });
+      expect(records).toContainEqual({
+        event: 'permission_approval_result',
+        properties: expect.objectContaining({
+          tool_name: 'Bash',
+          result: 'rejected',
+          has_feedback: true,
+        }),
+      });
+    });
+
+    it('falls back to the broker when hooks return no decision', async () => {
+      hookDecisionFlag = true;
+      hasPermissionHooks = true;
+      hookTrigger.mockResolvedValue([{ action: 'allow' }]);
+      const request = useBroker(async () => ({ decision: 'approved' }));
+      const svc = make();
+
+      await expect(
+        svc.requestToolApproval(makeContext('Bash'), ask(), 'fallback-ask'),
+      ).resolves.toBeUndefined();
+
+      expect(hookTrigger).toHaveBeenCalledTimes(1);
+      expect(request).toHaveBeenCalledTimes(1);
+    });
+
+    it('falls back to the broker when the hook round throws', async () => {
+      hookDecisionFlag = true;
+      hasPermissionHooks = true;
+      hookTrigger.mockRejectedValue(new Error('runner broken'));
+      const request = useBroker(async () => ({ decision: 'approved' }));
+      const svc = make();
+
+      await expect(
+        svc.requestToolApproval(makeContext('Bash'), ask(), 'fallback-ask'),
+      ).resolves.toBeUndefined();
+
+      expect(hookTrigger).toHaveBeenCalledTimes(1);
+      expect(request).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not run the hook round without PermissionRequest hooks', async () => {
+      hookDecisionFlag = true;
+      hasPermissionHooks = false;
+      const request = useBroker(async () => ({ decision: 'approved' }));
+      const svc = make();
+
+      await svc.requestToolApproval(makeContext('Bash'), ask(), 'fallback-ask');
+
+      expect(hookTrigger).not.toHaveBeenCalled();
+      expect(request).toHaveBeenCalledTimes(1);
+    });
+
+    it('never triggers PermissionRequest hooks when the flag is off', async () => {
+      hookDecisionFlag = false;
+      hasPermissionHooks = true;
+      const request = useBroker(async () => ({ decision: 'approved' }));
+      const svc = make();
+
+      await svc.requestToolApproval(makeContext('Bash'), ask(), 'fallback-ask');
+
+      expect(hookTrigger).not.toHaveBeenCalled();
+      expect(request).toHaveBeenCalledTimes(1);
+    });
+
+    it('never triggers PermissionRequest hooks without an approval broker', async () => {
+      hookDecisionFlag = true;
+      hasPermissionHooks = true;
+      const svc = make();
+
+      await expect(
+        svc.requestToolApproval(makeContext('Bash'), ask(), 'fallback-ask'),
+      ).resolves.toBeUndefined();
+
+      expect(hookTrigger).not.toHaveBeenCalled();
+      expect(recorded[0]).toMatchObject({ result: { decision: 'approved' } });
     });
   });
 
