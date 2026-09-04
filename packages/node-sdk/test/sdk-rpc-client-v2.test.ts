@@ -39,7 +39,7 @@ import {
   Error2,
   getLiveSessionById,
   HostProcessError,
-  AgentTodo,
+  IAgentTodoService,
   IAgentLifecycleService,
   IAgentTowerService,
   IHostRequestHeaders,
@@ -800,6 +800,45 @@ key = "${titleOAuthRef.key}"
     }
   });
 
+  it('serves suggestFiles through the workspace handler fs service', async () => {
+    const { harness } = await makeHarness();
+    const workDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-work-'));
+    tempDirs.push(workDir);
+    await mkdir(join(workDir, 'src'), { recursive: true });
+    await writeFile(join(workDir, 'src', 'app.ts'), 'app');
+    await writeFile(join(workDir, 'src', 'index.ts'), 'index');
+    await writeFile(join(workDir, 'README.md'), 'readme');
+    try {
+      const matched = await harness.suggestFiles(workDir, { query: 'app', limit: 20 });
+      expect(matched?.items).toContainEqual(
+        expect.objectContaining({ kind: 'file', path: 'src/app.ts', name: 'app.ts' }),
+      );
+      const appItem = matched?.items.find((item) => item.name === 'app.ts');
+      expect(appItem?.matchPositions.length).toBeGreaterThan(0);
+
+      const topLevel = await harness.suggestFiles(workDir, { query: '', limit: 20 });
+      expect(topLevel?.items).toContainEqual(expect.objectContaining({ kind: 'directory', name: 'src' }));
+      expect(topLevel?.items).toContainEqual(expect.objectContaining({ kind: 'file', name: 'README.md' }));
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('rejects an out-of-range suggestFiles limit before touching the engine', async () => {
+    const { harness } = await makeHarness();
+    const workDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-work-'));
+    tempDirs.push(workDir);
+    try {
+      for (const limit of [0, -1, 201, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+        await expect(harness.suggestFiles(workDir, { query: 'a', limit })).rejects.toMatchObject({
+          code: ErrorCodes.REQUEST_INVALID,
+        });
+      }
+    } finally {
+      await harness.close();
+    }
+  });
+
   it('honors skillDirs (explicit dirs) over default user / project discovery', async () => {
     const homeDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-'));
     tempDirs.push(homeDir);
@@ -1011,8 +1050,8 @@ key = "${titleOAuthRef.key}"
       const handle = getLiveSessionById(client.engineAccessor, 'ses_todos');
       expect(handle).toBeDefined();
       const manager = handle!.accessor.get(IAgentLifecycleService);
-      const main = await manager.create({ agentId: 'main' });
-      const todo = manager.resolve(main, AgentTodo);
+      await manager.create({ agentId: 'main' });
+      const todo = manager.handleOf('main')!.accessor.get(IAgentTodoService);
       await todo.replace([
         { title: 'write tests', status: 'in_progress' },
         { title: 'ship it', status: 'pending' },
@@ -1055,8 +1094,8 @@ key = "${titleOAuthRef.key}"
       };
 
       await client.setTowerMode({ sessionId: 'ses_tower', enabled: true });
-      // The tower feature is flag-gated engine-side, so enter() may be a
-      // no-op; the wire must always mirror the engine truth.
+      // A refused enter() rejects with a typed reason, so a resolved call
+      // means the engine activated tower mode; the wire mirrors it.
       expect((await client.getStatus({ sessionId: 'ses_tower' })).towerMode).toBe(
         mainTower().isActive,
       );
@@ -1075,6 +1114,7 @@ key = "${titleOAuthRef.key}"
   });
 
   it('rejects setTowerMode when the tower feature is unavailable', async () => {
+    vi.stubEnv('KIMI_CODE_EXPERIMENTAL_TOWER', '0');
     vi.stubEnv('KIMI_CODE_EXPERIMENTAL_FLAG', '0');
     const homeDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-'));
     tempDirs.push(homeDir);
@@ -1085,7 +1125,10 @@ key = "${titleOAuthRef.key}"
       await client.createSession({ id: 'ses_tower_off', workDir });
 
       await expect(client.setTowerMode({ sessionId: 'ses_tower_off', enabled: true }))
-        .rejects.toMatchObject({ code: 'session.tower_mode_invalid' });
+        .rejects.toMatchObject({
+          code: 'session.tower_mode_invalid',
+          message: expect.stringContaining('the tower experiment is disabled'),
+        });
       expect((await client.getStatus({ sessionId: 'ses_tower_off' })).towerMode).toBe(false);
 
       await client.setTowerMode({ sessionId: 'ses_tower_off', enabled: false });
@@ -1312,6 +1355,81 @@ describe('SDKRpcClientV2 engine telemetry', () => {
       await session.close();
     } finally {
       await harness.close();
+    }
+  });
+
+  it('emits session_started once per open, with the harness schema and enabled experimental flags', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-tel-flags-'));
+    tempDirs.push(homeDir);
+    const workDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-tel-flags-work-'));
+    tempDirs.push(workDir);
+    await writeFile(join(homeDir, 'config.toml'), '[experimental]\nsubagent_fork = true\n', 'utf-8');
+    const records: TelemetryRecord[] = [];
+    const harness = createKimiHarnessV2({
+      homeDir,
+      identity: TEST_IDENTITY,
+      telemetry: recordingTelemetry(records),
+    });
+    try {
+      const session = await harness.createSession({ workDir });
+      // The harness row is the sole producer: the forwarding appender drops
+      // the engine's own session_started, or every open would double-count.
+      const started = records.filter((record) => record.event === 'session_started');
+      expect(started).toHaveLength(1);
+      expect(started[0]).toMatchObject({
+        sessionId: session.id,
+        properties: {
+          client_name: 'kimi-code-cli',
+          client_version: '0.0.0-test',
+          ui_mode: 'shell',
+          resumed: false,
+        },
+      });
+      for (const record of started) {
+        const flags = String(record.properties?.['experimental_flags'] ?? '').split(',');
+        expect(flags).toContain('subagent_fork');
+        expect(flags).toContain('wait_for');
+      }
+      await session.close();
+      await harness.resumeSession({ id: session.id });
+      const afterResume = records.filter((record) => record.event === 'session_started');
+      expect(afterResume).toHaveLength(2);
+      expect(afterResume[1]).toMatchObject({
+        sessionId: session.id,
+        properties: { resumed: true },
+      });
+      const distinct = new Set(afterResume.map((record) => record.properties?.['experimental_flags']));
+      expect(distinct.size).toBe(1);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('keeps forwarding the engine session_started to a direct SDKRpcClientV2 consumer', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-tel-direct-'));
+    tempDirs.push(homeDir);
+    const workDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-tel-direct-work-'));
+    tempDirs.push(workDir);
+    const records: TelemetryRecord[] = [];
+    const client = new SDKRpcClientV2({
+      homeDir,
+      identity: TEST_IDENTITY,
+      telemetry: recordingTelemetry(records),
+    });
+    try {
+      // No harness wraps this client, so nothing else emits session_started —
+      // the engine's own row must survive forwarding.
+      const summary = await client.createSession({ workDir });
+      const started = records.filter((record) => record.event === 'session_started');
+      expect(started).toHaveLength(1);
+      expect(started[0]).toMatchObject({ properties: { resumed: false } });
+      await client.closeSession({ sessionId: summary.id });
+      await client.resumeSession({ id: summary.id });
+      const afterResume = records.filter((record) => record.event === 'session_started');
+      expect(afterResume).toHaveLength(2);
+      expect(afterResume[1]).toMatchObject({ properties: { resumed: true } });
+    } finally {
+      await client.close();
     }
   });
 });
