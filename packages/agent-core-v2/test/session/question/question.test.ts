@@ -77,7 +77,7 @@ describe('ISessionQuestionService (Session scope facade over the interaction ker
   });
 
   it('enqueue returns immediately and the answer streams over onDidResolve', () => {
-    const interaction = interactions.runtimeOf('main');
+    const interaction = interactions.serviceOf('main');
     const questions = session.accessor.get(ISessionQuestionService);
 
     const resolved: { id: string; response: unknown }[] = [];
@@ -120,20 +120,53 @@ describe('ISessionQuestionService (Session scope facade over the interaction ker
 
     const sub = questions.request(makeRequest('q-sub'), { agentId: 'sub-1' });
     expect(
-      interactions.runtimeOf('sub-1').listPending().find((i) => i.id === 'q-sub')?.origin,
+      interactions.serviceOf('sub-1').listPending().find((i) => i.id === 'q-sub')?.origin,
     ).toMatchObject({
       agentId: 'sub-1',
     });
 
     const main = questions.request(makeRequest('q-main'));
     expect(
-      interactions.runtimeOf('main').listPending().find((i) => i.id === 'q-main')?.origin.agentId,
+      interactions.serviceOf('main').listPending().find((i) => i.id === 'q-main')?.origin.agentId,
     ).toBeUndefined();
 
     questions.dismiss('q-sub');
     questions.dismiss('q-main');
     await expect(sub).resolves.toBeNull();
     await expect(main).resolves.toBeNull();
+  });
+
+  it('a detached request is not bound to the asking turn', async () => {
+    const interaction = interactions.serviceOf('main');
+    const questions = session.accessor.get(ISessionQuestionService);
+
+    const foreground = questions.request({ ...makeRequest('q-fg'), turnId: 3 });
+    const detached = questions.request({ ...makeRequest('q-bg'), turnId: 3 }, { detached: true });
+    expect(interaction.listPending().find((i) => i.id === 'q-fg')?.origin.turnId).toBe(3);
+    expect(interaction.listPending().find((i) => i.id === 'q-bg')?.origin.turnId).toBeUndefined();
+
+    interaction.cancelPendingForTurn(3);
+
+    await expect(foreground).resolves.toBeNull();
+    expect(questions.listPending().map((r) => r.id)).toEqual(['q-bg']);
+    expect(questions.listPending()[0]?.turnId).toBe(3);
+
+    questions.answer('q-bg', { answers: { q_0: 'Yes' } });
+    await expect(detached).resolves.toEqual({ answers: { q_0: 'Yes' } });
+  });
+
+  it('resolves a request cancelled by its turn ending as a dismissal', async () => {
+    const interaction = interactions.serviceOf('main');
+    const questions = session.accessor.get(ISessionQuestionService);
+    const resolved: { id: string; response: unknown }[] = [];
+    disposables.add(interaction.onDidResolve((r) => resolved.push(r)));
+
+    const pending = questions.request({ ...makeRequest('q1'), turnId: 2 });
+    interaction.cancelPendingForTurn(2);
+
+    await expect(pending).resolves.toBeNull();
+    expect(resolved).toEqual([{ id: 'q1', response: { cancelled: true, reason: 'turn_ended' } }]);
+    expect(questions.listPending()).toEqual([]);
   });
 
   it('request with a pre-aborted signal resolves null and parks nothing', async () => {
@@ -148,7 +181,7 @@ describe('ISessionQuestionService (Session scope facade over the interaction ker
   });
 
   it('aborting a parked request dismisses it and resolves the caller with null', async () => {
-    const interaction = interactions.runtimeOf('main');
+    const interaction = interactions.serviceOf('main');
     const questions = session.accessor.get(ISessionQuestionService);
 
     const resolved: { id: string; response: unknown }[] = [];
@@ -197,7 +230,7 @@ describe('ISessionQuestionService (Session scope facade over the interaction ker
   });
 
   it('mints distinct interaction ids when the provider reuses a toolCallId', async () => {
-    const interaction = interactions.runtimeOf('main');
+    const interaction = interactions.serviceOf('main');
     const questions = session.accessor.get(ISessionQuestionService);
     const req = (): QuestionRequest => ({
       toolCallId: 'AskUserQuestion:0',
