@@ -8,6 +8,7 @@ import {
   IAgentCronService,
   IAgentGoalService,
   IAgentLifecycleService,
+  IAgentLoopService,
   IAgentPermissionModeService,
   IAgentProfileService,
   IAgentPromptService,
@@ -17,6 +18,7 @@ import {
   IBootstrapService,
   IConfigService,
   IEventBus,
+  IEventDispatcher,
   IFileSystemStorageService,
   IOAuthToolkit,
   ISessionIndex,
@@ -181,11 +183,23 @@ function makeFakeHarness() {
             }),
           };
         }),
+        drain: vi.fn(async () => {}),
+        list: vi.fn(() => ({ launching: false, active: undefined, pending: [] })),
       },
     ],
-    [IAgentTaskService, { list: vi.fn(() => []) }],
+    [IAgentTaskService, { list: vi.fn(() => []), stopAllOnExit: vi.fn(async () => []) }],
     [IAgentCronService, { getNextFireTime: vi.fn(() => null) }],
     [IAgentGoalService, goal],
+    [IEventDispatcher, { flush: vi.fn(async () => {}) }],
+    [
+      IAgentLoopService,
+      {
+        status: vi.fn(() => ({ state: 'idle', pendingTurnIds: [] })),
+        cancel: vi.fn(() => false),
+        settled: vi.fn(async () => {}),
+        tryAcquireQuiescence: vi.fn(() => ({ dispose: vi.fn() })),
+      },
+    ],
     [
       IAgentScopeContext,
       makeAgentScopeContext({ agentId: 'main', agentScope: 'agents/main' }),
@@ -274,7 +288,7 @@ function makeFakeHarness() {
     ],
   ]);
   const app = fakeScope('app', appServices);
-  return { app, agent, session, agentServices, appServices, profileState };
+  return { app, agent, session, agentServices, sessionServices, appServices, profileState };
 }
 
 describe('runV2Print', () => {
@@ -612,5 +626,201 @@ describe('runV2Print', () => {
     const reconcileOrder = mocks.setTelemetryModel.mock.invocationCallOrder[0];
     expect(initOrder).toBeDefined();
     expect(reconcileOrder).toBeGreaterThan(initOrder!);
+  });
+
+  it('flushes the wire journal before disposing the app', async () => {
+    const stdout = writer();
+    const stderr = writer();
+    const { app, agentServices } = makeFakeHarness();
+
+    mocks.bootstrap.mockReturnValue({ app });
+    mocks.ensureMainAgent.mockResolvedValue({ agentId: 'main', generation: 1 });
+
+    await runV2Print(opts() as never, '1.2.3-test', { stdout, stderr });
+
+    const dispatcher = agentServices.get(IEventDispatcher) as {
+      flush: ReturnType<typeof vi.fn>;
+    };
+    expect(dispatcher.flush).toHaveBeenCalled();
+    const flushOrder = dispatcher.flush.mock.invocationCallOrder[0];
+    const disposeOrder = app.dispose.mock.invocationCallOrder[0];
+    expect(flushOrder).toBeDefined();
+    expect(disposeOrder).toBeGreaterThan(flushOrder!);
+  });
+
+  it('flushes the wire journal when the turn fails', async () => {
+    const stdout = writer();
+    const stderr = writer();
+    const { app, agentServices } = makeFakeHarness();
+
+    const promptService = agentServices.get(IAgentPromptService) as {
+      enqueue: ReturnType<typeof vi.fn>;
+    };
+    promptService.enqueue.mockResolvedValueOnce({
+      launched: Promise.resolve({
+        id: 1,
+        result: Promise.resolve({
+          type: 'failed',
+          error: { code: 'provider.overloaded', message: 'llm request failed' },
+        }),
+      }),
+    });
+
+    mocks.bootstrap.mockReturnValue({ app });
+    mocks.ensureMainAgent.mockResolvedValue({ agentId: 'main', generation: 1 });
+
+    await expect(runV2Print(opts() as never, '1.2.3-test', { stdout, stderr })).rejects.toThrow(
+      'provider.overloaded: llm request failed',
+    );
+
+    const dispatcher = agentServices.get(IEventDispatcher) as {
+      flush: ReturnType<typeof vi.fn>;
+    };
+    expect(dispatcher.flush).toHaveBeenCalled();
+    const flushOrder = dispatcher.flush.mock.invocationCallOrder[0];
+    const disposeOrder = app.dispose.mock.invocationCallOrder[0];
+    expect(disposeOrder).toBeGreaterThan(flushOrder!);
+  });
+
+  it('does not let a wire flush failure mask the turn outcome', async () => {
+    const stdout = writer();
+    const stderr = writer();
+    const { app, agentServices } = makeFakeHarness();
+
+    const promptService = agentServices.get(IAgentPromptService) as {
+      enqueue: ReturnType<typeof vi.fn>;
+    };
+    promptService.enqueue.mockResolvedValueOnce({
+      launched: Promise.resolve({
+        id: 1,
+        result: Promise.resolve({
+          type: 'failed',
+          error: { code: 'provider.overloaded', message: 'llm request failed' },
+        }),
+      }),
+    });
+    const dispatcher = agentServices.get(IEventDispatcher) as {
+      flush: ReturnType<typeof vi.fn>;
+    };
+    dispatcher.flush.mockRejectedValueOnce(new Error('disk full'));
+
+    mocks.bootstrap.mockReturnValue({ app });
+    mocks.ensureMainAgent.mockResolvedValue({ agentId: 'main', generation: 1 });
+
+    await expect(runV2Print(opts() as never, '1.2.3-test', { stdout, stderr })).rejects.toThrow(
+      'provider.overloaded: llm request failed',
+    );
+    expect(app.dispose).toHaveBeenCalled();
+  });
+
+  it('cancels and settles the active turn before flushing on a termination signal', async () => {
+    const stdout = writer();
+    const stderr = writer();
+    const { app, agentServices } = makeFakeHarness();
+
+    const order: string[] = [];
+    const loop = agentServices.get(IAgentLoopService) as {
+      status: ReturnType<typeof vi.fn>;
+      cancel: ReturnType<typeof vi.fn>;
+      settled: ReturnType<typeof vi.fn>;
+      tryAcquireQuiescence: ReturnType<typeof vi.fn>;
+    };
+    loop.status.mockReturnValue({ state: 'running', pendingTurnIds: [] });
+    loop.cancel.mockImplementation(() => {
+      if (!order.includes('cancel')) order.push('cancel');
+      return true;
+    });
+    loop.settled = vi.fn(async () => {
+      if (!order.includes('settled')) order.push('settled');
+    });
+    const guardDispose = vi.fn();
+    loop.tryAcquireQuiescence = vi.fn(() => ({ dispose: guardDispose }));
+    const taskService = agentServices.get(IAgentTaskService) as {
+      stopAllOnExit: ReturnType<typeof vi.fn>;
+    };
+    taskService.stopAllOnExit = vi.fn(async () => {
+      if (!order.includes('stop')) order.push('stop');
+      return [];
+    });
+    const dispatcher = agentServices.get(IEventDispatcher) as {
+      flush: ReturnType<typeof vi.fn>;
+    };
+    dispatcher.flush = vi.fn(async () => {
+      order.push('flush');
+    });
+
+    // A turn still in flight when the signal arrives: the prompt queue reports
+    // the launch window, then the running prompt, then goes empty.
+    const promptService = agentServices.get(IAgentPromptService) as {
+      enqueue: ReturnType<typeof vi.fn>;
+      drain: ReturnType<typeof vi.fn>;
+      list: ReturnType<typeof vi.fn>;
+    };
+    let settleTurn!: (result: unknown) => void;
+    promptService.enqueue.mockResolvedValueOnce({
+      launched: Promise.resolve({
+        id: 1,
+        result: new Promise((resolve) => {
+          settleTurn = resolve;
+        }),
+      }),
+    });
+    let promptPhase: 'launching' | 'active' | 'empty' = 'launching';
+    promptService.list = vi.fn(() => {
+      if (promptPhase === 'launching') {
+        return { launching: true, active: undefined, pending: [] };
+      }
+      if (promptPhase === 'active') {
+        return { launching: false, active: { id: 'p1' }, pending: [] };
+      }
+      return { launching: false, active: undefined, pending: [] };
+    });
+
+    const handlers = new Map<string, () => Promise<void>>();
+    const fakeProcess = {
+      once: (signal: string, handler: () => Promise<void>) => {
+        handlers.set(signal, handler);
+      },
+      off: () => {},
+      exit: vi.fn((code?: number) => {
+        order.push(`exit:${code}`);
+      }),
+    };
+
+    mocks.bootstrap.mockReturnValue({ app });
+    mocks.ensureMainAgent.mockResolvedValue({ agentId: 'main', generation: 1 });
+
+    const run = runV2Print(opts() as never, '1.2.3-test', {
+      stdout,
+      stderr,
+      process: fakeProcess as never,
+    });
+    const outcome = run.catch((error: unknown) => error);
+    for (let i = 0; i < 100 && !handlers.has('SIGINT'); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    const onSigint = handlers.get('SIGINT')!;
+    settleTurn({ type: 'cancelled', steps: 0, reason: new Error('aborted') });
+    const sigintRun = onSigint();
+    // The flush must wait for the prompt queue to empty, even with idle loops.
+    for (let i = 0; i < 100 && !order.includes('settled'); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(promptService.drain).toHaveBeenCalled();
+    expect(order).toEqual(['stop', 'cancel', 'settled']);
+    promptPhase = 'active';
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(order).toEqual(['stop', 'cancel', 'settled']);
+    promptPhase = 'empty';
+    await sigintRun;
+
+    expect(order).toEqual(['stop', 'cancel', 'settled', 'flush', 'exit:130']);
+    // The guard taken during quiesce is only released after app.dispose().
+    expect(loop.tryAcquireQuiescence).toHaveBeenCalled();
+    const lastGuardRelease = guardDispose.mock.invocationCallOrder.at(-1);
+    const appDisposeOrder = app.dispose.mock.invocationCallOrder[0];
+    expect(lastGuardRelease).toBeGreaterThan(appDisposeOrder!);
+    expect(await outcome).toBeInstanceOf(Error);
   });
 });
