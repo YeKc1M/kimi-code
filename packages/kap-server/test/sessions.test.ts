@@ -3,6 +3,10 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { inflateRawSync } from 'node:zlib';
+import { ISessionMediaStore } from '@moonshot-ai/agent-core-v2/agent/media/sessionMediaStore';
+import { mcpResultToExecutableOutput } from '@moonshot-ai/agent-core-v2/agent/mcp/output';
+import { renderToolResultForModel } from '@moonshot-ai/agent-core-v2/agent/contextMemory/toolResultRender';
+import { IReadTool, ReadInputSchema, type ReadInput } from '@moonshot-ai/agent-core-v2/agent/tools/os/read/read';
 
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
@@ -28,6 +32,7 @@ import {
   sessionDirOf,
   type ScopeSeed,
 } from '@moonshot-ai/agent-core-v2';
+import { SessionMetaUpdated } from '@moonshot-ai/agent-core-v2/session/sessionMetadata/sessionMetaEvents';
 import { TurnStarted } from '@moonshot-ai/agent-core-v2/agent/loop/turnEvents';
 import { sessionWarningsResponseSchema } from '@moonshot-ai/agent-core-v2/app/sessionLegacy/sessionProtocol';
 import { encodeWorkDirKey } from '@moonshot-ai/agent-core-v2/_base/utils/workdir-slug';
@@ -953,6 +958,137 @@ describe('server-v2 /api/v1/sessions', () => {
     expect(body.code).toBe(40401);
   });
 
+  it('deletes a session via :delete and publishes event.session.deleted', async () => {
+    const cwd = home as string;
+    const created = await postJson<SessionWire>('/api/v1/sessions', { metadata: { cwd } });
+    const id = created.body.data.id;
+    const workspaceId = created.body.data.workspace_id;
+
+    const events: Event2<any>[] = [];
+    const sub = (server as RunningServer).core.accessor
+      .get(IEventService)
+      .subscribe((event) => events.push(event));
+    try {
+      const deleted = await postJson<{ deleted: boolean }>(`/api/v1/sessions/${id}:delete`);
+      expect(deleted.body.code).toBe(0);
+      expect(deleted.body.data).toEqual({ deleted: true });
+
+      const got = await getJson<null>(`/api/v1/sessions/${id}`);
+      expect(got.body.code).toBe(40401);
+      await expect(readFile(join(home!, 'server', 'events', `${id}.jsonl`))).rejects.toMatchObject({ code: 'ENOENT' });
+
+      expect(
+        events
+          .filter((event) => event.type === 'event.session.deleted')
+          .map((event) => (event as { readonly payload?: unknown }).payload),
+      ).toEqual([{ sessionId: id, workspaceId }]);
+    } finally {
+      sub.dispose();
+    }
+  });
+
+  it('deletes a cold session via :delete and publishes event.session.deleted', async () => {
+    const cwd = home as string;
+    const created = await postJson<SessionWire>('/api/v1/sessions', { metadata: { cwd } });
+    const id = created.body.data.id;
+    const workspaceId = created.body.data.workspace_id;
+    await closeSessionById((server as RunningServer).core.accessor, id);
+    expect(getLiveSessionById((server as RunningServer).core.accessor, id)).toBeUndefined();
+
+    const events: Event2<any>[] = [];
+    const sub = (server as RunningServer).core.accessor
+      .get(IEventService)
+      .subscribe((event) => events.push(event));
+    try {
+      const deleted = await postJson<{ deleted: boolean }>(`/api/v1/sessions/${id}:delete`);
+      expect(deleted.body.code).toBe(0);
+      expect(deleted.body.data).toEqual({ deleted: true });
+
+      expect(
+        events
+          .filter((event) => event.type === 'event.session.deleted')
+          .map((event) => (event as { readonly payload?: unknown }).payload),
+      ).toEqual([{ sessionId: id, workspaceId }]);
+    } finally {
+      sub.dispose();
+    }
+  });
+
+  it('keeps failed journal cleanup retriable without publishing deletion', async () => {
+    const created = await postJson<SessionWire>('/api/v1/sessions', { metadata: { cwd: home } });
+    const id = created.body.data.id;
+    const journalPath = join(home!, 'server', 'events', `${id}.jsonl`);
+    await vi.waitFor(async () => expect(await readFile(journalPath, 'utf8')).toContain('journal_header'));
+    await closeSessionById(server!.core.accessor, id);
+    await rm(journalPath);
+    await mkdir(journalPath);
+    const events: Event2<any>[] = [];
+    const sub = server!.core.accessor.get(IEventService).subscribe((event) => events.push(event));
+    try {
+      const failed = await postJson(`/api/v1/sessions/${id}:delete`);
+      expect(failed.body.code).not.toBe(0);
+      expect(await server!.core.accessor.get(ISessionManager).status(id)).toBeDefined();
+      expect(events.filter((event) => event.type === 'event.session.deleted')).toEqual([]);
+      await rm(journalPath, { recursive: true });
+      const retried = await postJson<{ deleted: boolean }>(`/api/v1/sessions/${id}:delete`);
+      expect(retried.body.data).toEqual({ deleted: true });
+      expect(events.filter((event) => event.type === 'event.session.deleted')).toHaveLength(1);
+      await expect(readFile(journalPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      sub.dispose();
+    }
+  });
+
+  it.each(['closing', 'cleanup'] as const)('waits for %s before recreating an explicit session id', async (phase) => {
+    const manager = server!.core.accessor.get(ISessionManager);
+    const created = await postJson<SessionWire>('/api/v1/sessions', { metadata: { cwd: home } });
+    const id = created.body.data.id;
+    const journalPath = join(home!, 'server', 'events', `${id}.jsonl`);
+    await vi.waitFor(async () => expect(await readFile(journalPath, 'utf8')).toContain('journal_header'));
+    const oldJournal = await readFile(journalPath, 'utf8');
+    let enter!: () => void;
+    let release!: () => void;
+    const entered = new Promise<void>((resolve) => { enter = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const event = phase === 'closing' ? manager.onWillCloseSession! : manager.onWillDeleteSession!;
+    const sub = event((event) => {
+      if (event.sessionId !== id) return;
+      event.waitUntil(gate);
+      enter();
+    });
+    try {
+      const deletion = manager.delete(id);
+      await entered;
+      let recreated = false;
+      const creation = manager.create({ sessionId: id, workDir: home! }).then((handle) => {
+        recreated = true;
+        return handle;
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(recreated).toBe(false);
+      release();
+      await deletion;
+      await creation;
+      server!.core.accessor.get(IEventService).publish(new SessionMetaUpdated({
+        payload: { sessionId: id, agentId: 'main', patch: { title: 'Recreated session' } },
+      }));
+      await vi.waitFor(async () => {
+        const journal = await readFile(journalPath, 'utf8');
+        expect(journal).toContain('journal_header');
+        expect(JSON.parse(journal.split('\n')[0]!).epoch).not.toBe(JSON.parse(oldJournal.split('\n')[0]!).epoch);
+      });
+      expect(manager.get(id)).toBeDefined();
+    } finally {
+      release();
+      sub.dispose();
+    }
+  });
+
+  it('returns 40401 when deleting a missing session', async () => {
+    const { body } = await postJson<null>('/api/v1/sessions/sess_missing:delete');
+    expect(body.code).toBe(40401);
+  });
+
   it('cold-loads a persisted session on :undo instead of 40401', async () => {
     const cwd = home as string;
     const created = await postJson<SessionWire>('/api/v1/sessions', { metadata: { cwd } });
@@ -1090,6 +1226,58 @@ describe('server-v2 /api/v1/sessions', () => {
     expect(forkedCron.list().map((t) => ({ id: t.id, prompt: t.prompt }))).toEqual([
       { id: task.id, prompt: 'fork me' },
     ]);
+  });
+
+  it('continues a paginated attachment read after forking and removing the source file', async () => {
+    const parent = await postJson<SessionWire>('/api/v1/sessions', { metadata: { cwd: home as string } });
+    const parentId = parent.body.data.id;
+    const core = (server as RunningServer).core;
+    const session = getLiveSessionById(core.accessor, parentId)!;
+    const body = '😀'.repeat(600) + '\n' + Array.from({ length: 30 }, (_, i) => `line ${String(i)} é`).join('\n');
+    const output = await mcpResultToExecutableOutput({
+      isError: false,
+      content: [{ type: 'resource', resource: {
+        uri: 'example://report', mimeType: 'text/plain', blob: Buffer.from(body).toString('base64'),
+      } }],
+    }, 'mcp__example__report', { attachmentStore: session.accessor.get(ISessionMediaStore) });
+    const text = renderToolResultForModel(output).map((part) => part.type === 'text' ? part.text : '').join('\n');
+    const sourcePath = JSON.parse(/Original attachment saved at: ("[^\n]+")/.exec(text)![1]!) as string;
+    const reference = JSON.parse(/Attachment reference: ("[^\n]+")/.exec(text)![1]!) as string;
+    const sourceAgents = session.accessor.get(IAgentLifecycleService);
+    await sourceAgents.create({ agentId: MAIN_AGENT_ID });
+    let reader = sourceAgents.handleOf(MAIN_AGENT_ID)!.accessor.get(IReadTool);
+    let args: ReadInput | undefined = { path: reference, max_chars: 500 };
+    const firstExecution = await reader.resolveExecution(args);
+    if (firstExecution.isError === true) throw new Error(JSON.stringify(firstExecution.output));
+    const first = await firstExecution.execute({ turnId: 1, toolCallId: 'read-first', signal: new AbortController().signal });
+    expect(first.isError).not.toBe(true);
+    let recovered = (first.output as string).replaceAll(/^\d+\t/gm, '');
+    const firstNext = /Next Read: (\{[^\n]*\})/.exec(first.note ?? '')?.[1];
+    expect(firstNext).toBeDefined();
+    args = ReadInputSchema.parse(JSON.parse(firstNext!));
+    expect(args.path).toBe(reference);
+    expect(args.column_offset).toBeGreaterThan(0);
+    const forked = await postJson<SessionWire>(`/api/v1/sessions/${parentId}:fork`, {});
+    expect(forked.body.code).toBe(0);
+    await rm(sourcePath);
+    const resumed = await resumeSessionById(core.accessor, forked.body.data.id);
+    const agents = resumed!.accessor.get(IAgentLifecycleService);
+    await agents.create({ agentId: MAIN_AGENT_ID });
+    reader = agents.handleOf(MAIN_AGENT_ID)!.accessor.get(IReadTool);
+    let pages = 0;
+    while (args !== undefined && pages < 80) {
+      expect(args.path).toBe(reference);
+      const execution = await reader.resolveExecution(args);
+      if (execution.isError === true) throw new Error(JSON.stringify(execution.output));
+      const read = await execution.execute({ turnId: 1, toolCallId: `read-${String(pages++)}`, signal: new AbortController().signal });
+      expect(read.isError).not.toBe(true);
+      if ((args.column_offset ?? 0) === 0) recovered += '\n';
+      recovered += (read.output as string).replaceAll(/^\d+\t/gm, '');
+      const next = /Next Read: (\{[^\n]*\})/.exec(read.note ?? '')?.[1];
+      args = next === undefined ? undefined : ReadInputSchema.parse(JSON.parse(next));
+    }
+    expect(args).toBeUndefined();
+    expect(recovered).toBe(body);
   });
 
   it('fork copies a corrupted source wire without healing it; the fork heals on resume', async () => {
@@ -1849,7 +2037,7 @@ describe('server-v2 /api/v1/sessions (minidb read model)', () => {
   let home: string | undefined;
   let base: string;
 
-  const READ_MODEL_ENV = 'KIMI_CODE_EXPERIMENTAL_PERSISTENCE_MINIDB_READMODEL';
+  const READ_MODEL_ENV = 'KIMI_CODE_PERSISTENCE_MINIDB_READMODEL';
 
   const READ_MODEL_CONFIG = [
     'default_model = "stub"',

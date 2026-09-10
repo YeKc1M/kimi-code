@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 
 import { permissionDecisionFromResults } from '#/features/externalHooks/internal/matchHooks';
 import type { HookResult } from '#/features/externalHooks/internal/types';
-import type { ContentPart } from '#/kosong/contract/message';
+import type { ContentPart } from '#human/llm/message';
 import { describe, expect, it, vi } from 'vitest';
 
 import { makeHookRunner } from './runner-stub';

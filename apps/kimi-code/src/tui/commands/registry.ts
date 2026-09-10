@@ -201,7 +201,6 @@ export const BUILTIN_SLASH_COMMANDS = [
     // for the previous one to finish.
     availability: 'always',
     experimentalFlag: 'tower',
-    requiresEngineV2: true,
   },
   {
     name: 'model',
@@ -216,7 +215,6 @@ export const BUILTIN_SLASH_COMMANDS = [
     description: 'Configure the secondary model for subagents',
     priority: 90,
     availability: 'always',
-    experimentalFlag: 'secondary-model',
   },
   {
     name: 'effort',
@@ -434,10 +432,9 @@ export const BUILTIN_SLASH_COMMANDS = [
   {
     name: 'remote-control',
     aliases: ['rc'],
-    description: 'Open the current session through Kimi Remote Control (experimental)',
+    description: 'Open the current session through Kimi Remote Control',
     priority: 40,
     availability: 'always',
-    experimentalFlag: 'remote-control',
   },
   {
     name: 'exit',

@@ -47,6 +47,7 @@ export const stepTimingSchema = z.object({
   llmServerFirstTokenMs: z.number().optional(),
   llmServerDecodeMs: z.number().optional(),
   llmClientConsumeMs: z.number().optional(),
+  llmClientBlockedMs: z.number().optional(),
 });
 
 export const stepRetrySchema = z.object({
@@ -252,16 +253,6 @@ export const agentPhaseMetaSchema = z.discriminatedUnion('kind', [
     turnId: z.number(),
     step: z.number(),
     stepId: z.string(),
-    since: z.number(),
-  }),
-  z.object({
-    kind: z.literal('streaming'),
-    turnId: z.number(),
-    step: z.number(),
-    stepId: z.string(),
-    stream: z.enum(['assistant', 'thinking', 'tool_call']),
-    toolCallId: z.string().optional(),
-    toolName: z.string().optional(),
     since: z.number(),
   }),
   z.object({

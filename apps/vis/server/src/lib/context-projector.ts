@@ -346,7 +346,9 @@ export function projectContext(
           },
         };
         const legacyTail = rec.legacyTail === true || rec.keptUserMessageCount === undefined;
-        const summaryIndex = legacyTail ? 0 : shape.messages.length - 1;
+        const summaryIndex = legacyTail
+          ? 0
+          : shape.messages.findIndex((message) => message.origin?.kind === 'compaction_summary');
         const modelSummaryBubble: ProjectedMessage = {
           ...summaryBubble,
           message: modelFacingMessage(shape.messages[summaryIndex] ?? summaryBubble.message),
@@ -637,7 +639,7 @@ const MICRO_MIN_CONTENT_TOKENS = 100;
 
 /** Replicates the engine's per-char token weighting exactly, over the same
  *  `text` + `think` parts its gate counts. The engine
- *  (`packages/agent-core-v2/src/kosong/contract/tokens.ts`) sums per-part
+ *  (`packages/agent-core-v2/src/llm-adapter/contract/tokens.ts`) sums per-part
  *  estimates, each
  *  `estimateTokens(s) = Math.ceil(asciiCount / 4) + nonAsciiCount` (ASCII ~4
  *  chars/token, every non-ASCII/CJK code point a full token); other part types
