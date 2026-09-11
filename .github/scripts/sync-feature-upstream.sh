@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-FEATURE_BRANCH="${FEATURE_BRANCH:-feat/hook-permission-decisions}"
-SYNC_BRANCH="${SYNC_BRANCH:-feat/hook-permission-decisions-merge-main}"
-UPSTREAM_REPO="${UPSTREAM_REPO:-MoonshotAI/kimi-code}"
-UPSTREAM_BRANCH="${UPSTREAM_BRANCH:-main}"
+: "${FEATURE_BRANCH:?must be set (configure it as a repo Actions Variable)}"
+: "${SYNC_BRANCH:?must be set (configure it as a repo Actions Variable)}"
+: "${UPSTREAM_REPO:?must be set, e.g. MoonshotAI/kimi-code}"
+: "${UPSTREAM_BRANCH:?must be set, e.g. main}"
 UPSTREAM_URL="https://github.com/${UPSTREAM_REPO}.git"
 
 fail() {

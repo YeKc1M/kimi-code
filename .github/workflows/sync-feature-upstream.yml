@@ -48,8 +48,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
-          FEATURE_BRANCH: ${{ vars.FEATURE_BRANCH || 'feat/hook-permission-decisions' }}
-          SYNC_BRANCH: ${{ vars.SYNC_BRANCH || 'feat/hook-permission-decisions-merge-main' }}
-          UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO || 'MoonshotAI/kimi-code' }}
-          UPSTREAM_BRANCH: ${{ vars.UPSTREAM_BRANCH || 'main' }}
+          FEATURE_BRANCH: ${{ vars.FEATURE_BRANCH }}
+          SYNC_BRANCH: ${{ vars.SYNC_BRANCH }}
+          UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO }}
+          UPSTREAM_BRANCH: ${{ vars.UPSTREAM_BRANCH }}
         run: bash .github/scripts/sync-feature-upstream.sh
