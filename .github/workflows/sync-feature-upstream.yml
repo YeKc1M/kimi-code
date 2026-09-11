@@ -26,6 +26,21 @@ jobs:
         with:
           node-version: 24
 
+      # Repo pins pnpm via the packageManager field; corepack ships with Node
+      # and provides exactly that version. Native deps (node-pty) build with
+      # the runner's preinstalled gcc/python3.
+      - name: Enable pnpm via corepack
+        run: |
+          corepack enable
+          corepack prepare --activate
+
+      - name: Restore pnpm store cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/pnpm/store
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: pnpm-store-${{ runner.os }}-
+
       - name: Install kimi CLI
         run: npm install -g @moonshot-ai/kimi-code
 
