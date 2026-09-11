@@ -1,0 +1,40 @@
+name: Sync upstream into feature branch
+
+on:
+  schedule:
+    # 23:15 UTC = 07:15 Beijing time (UTC+8), daily
+    - cron: '15 23 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-feature-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install kimi CLI
+        run: npm install -g @moonshot-ai/kimi-code
+
+      - name: Sync upstream into feature branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+          FEATURE_BRANCH: ${{ vars.FEATURE_BRANCH || 'feat/hook-permission-decisions' }}
+          SYNC_BRANCH: ${{ vars.SYNC_BRANCH || 'feat/hook-permission-decisions-merge-main' }}
+          UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO || 'MoonshotAI/kimi-code' }}
+          UPSTREAM_BRANCH: ${{ vars.UPSTREAM_BRANCH || 'main' }}
+        run: bash .github/scripts/sync-feature-upstream.sh
