@@ -13,7 +13,7 @@ import { IAgentScopeContext } from '#/agent/scopeContext/scopeContext';
 import { IEventService } from '#/app/event/event';
 import { ITelemetryService } from '#/app/telemetry/telemetry';
 import { ErrorCodes, Error2 } from '#/errors';
-import type { ContentPart } from '#/kosong/contract/message';
+import type { ContentPart } from '#human/llm/message';
 import { MAIN_AGENT_ID } from '#/session/agentLifecycle/agentLifecycle';
 import { ISessionContext } from '#/session/sessionContext/sessionContext';
 import { ISessionMetadata } from '#/session/sessionMetadata/sessionMetadata';
@@ -105,6 +105,10 @@ export class AgentSkillService implements IAgentSkillService {
         'Cannot activate skill while another turn is active',
       );
     }
+    await turn.ready.catch(() => undefined);
+    if (turn.id === undefined) {
+      throw new Error2(ErrorCodes.INTERNAL, 'Skill activation turn ended before it started');
+    }
     if (this.scopeContext.agentContext.agentId === MAIN_AGENT_ID) {
       await applyPromptMetadataUpdate(
         {
@@ -163,6 +167,7 @@ export class AgentSkillService implements IAgentSkillService {
       if (turn === undefined && handle.state !== 'blocked') {
         throw new Error2(ErrorCodes.INTERNAL, 'promptWithSkills failed to launch a turn');
       }
+      if (turn !== undefined) await turn.ready.catch(() => undefined);
       return {
         turn_id: turn?.id,
         prompt_id: handle.id,

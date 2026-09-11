@@ -61,7 +61,7 @@ import type {
   ShellStartedPayload,
 } from '@moonshot-ai/agent-core-v2/agent/shellCommand/shellCommandService';
 
-import type { TurnStepRetryingPayload } from '@moonshot-ai/agent-core-v2/agent/stepRetry/stepRetryService';
+import type { TurnStepRetryingPayload } from '@moonshot-ai/agent-core-v2/agent/loop/turnEvents';
 import type { AgentTaskStatus } from '@moonshot-ai/agent-core-v2/agent/task/types';
 import type {
   ToolCallStartedPayload,
@@ -69,8 +69,8 @@ import type {
   ToolResultEventPayload,
 } from '@moonshot-ai/agent-core-v2/agent/toolExecutor/toolExecutorEvents';
 import type { UsageStatus } from '@moonshot-ai/agent-core-v2/agent/usage/usage';
-import type { FinishReason } from '@moonshot-ai/agent-core-v2/kosong/contract/provider';
-import type { TokenUsage } from '@moonshot-ai/agent-core-v2/kosong/contract/usage';
+import type { FinishReason } from '@moonshot-ai/agent-core-v2/human/llm/finish-reason';
+import type { TokenUsage } from '@moonshot-ai/agent-core-v2/human/llm/usage';
 import type {
   SubagentCompletedPayload,
   SubagentFailedPayload,
@@ -490,16 +490,6 @@ export const agentPhaseSchema = z.discriminatedUnion('kind', [
     since: z.number(),
   }),
   z.object({
-    kind: z.literal('streaming'),
-    turnId: z.number(),
-    step: z.number(),
-    stepId: z.string(),
-    stream: z.enum(['assistant', 'thinking', 'tool_call']),
-    toolCallId: z.string().optional(),
-    toolName: z.string().optional(),
-    since: z.number(),
-  }),
-  z.object({
     kind: z.literal('tool_call'),
     turnId: z.number(),
     step: z.number(),
@@ -581,6 +571,11 @@ export const sessionCreatedEventSchema = z.object({
 
 export const sessionArchivedEventSchema = z.object({
   type: z.literal('event.session.archived'),
+  workspace_id: z.string().min(1),
+});
+
+export const sessionDeletedEventSchema = z.object({
+  type: z.literal('event.session.deleted'),
   workspace_id: z.string().min(1),
 });
 
@@ -780,6 +775,7 @@ export const turnStepCompletedEventSchema = z.object({
   llmServerFirstTokenMs: z.number().optional(),
   llmServerDecodeMs: z.number().optional(),
   llmClientConsumeMs: z.number().optional(),
+  llmClientBlockedMs: z.number().optional(),
   providerFinishReason: finishReasonSchema.optional(),
   rawFinishReason: z.string().optional(),
 }) satisfies z.ZodType<TurnStepCompletedPayload>;
@@ -1055,6 +1051,7 @@ export const agentEventSchema = z.discriminatedUnion('type', [
   sessionMetaUpdatedEventSchema,
   sessionCreatedEventSchema,
   sessionArchivedEventSchema,
+  sessionDeletedEventSchema,
   workspaceCreatedEventSchema,
   workspaceUpdatedEventSchema,
   workspaceDeletedEventSchema,

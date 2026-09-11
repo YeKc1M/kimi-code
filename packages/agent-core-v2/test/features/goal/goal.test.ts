@@ -22,11 +22,7 @@ import {
   createMaxStepsExceededError,
   IAgentLoopService,
   type AfterStepContext,
-  type EnqueueReceipt,
-  type Step,
-  type Turn,
 } from '#/agent/loop/loop';
-import { MessageStepRequest } from '#/agent/loop/stepRequest';
 import { IAgentScopeContext } from '#/agent/scopeContext/scopeContext';
 import { IAgentSwarmService } from '#/features/swarm/agent/swarm';
 import { IAgentPermissionModeService } from '#/agent/permissionMode/permissionMode';
@@ -40,33 +36,34 @@ import type { ResolvedToolExecutionHookContext } from '#/agent/toolExecutor/tool
 import { IAgentToolRegistryService } from '#/agent/toolRegistry/toolRegistry';
 import type { WireRecord } from '#/wire/record';
 import { IEventBus } from '#/app/event/eventBus';
-import { APIConnectionError, APIStatusError } from '#/kosong/contract/errors';
-import type { ToolCall } from '#/kosong/contract/message';
-import type { TokenUsage } from '#/kosong/contract/usage';
+import { APIConnectionError, APIStatusError } from '#/llm-adapter/contract/errors';
+import type { ToolCall } from '#human/llm/message';
+import type { TokenUsage } from '#human/llm/usage';
 import { ErrorCodes, Error2, errorInfo, toKimiErrorPayload } from '#/errors';
 import type { ExecutableTool, RunnableToolExecution } from '#/tool/toolContract';
 import type { ToolInputDisplay } from '#/tool/toolInputDisplay';
 
 import {
   InMemoryWireRecordPersistence,
-  appService,
   agentService,
+  appService,
   createTestAgent as createHarnessTestAgent,
   execEnvServices,
   permissionModeServices,
+  requesterFromGenerateFn,
   sessionService,
   telemetryServices,
-  wireRecordPersistenceServices,
   type TestAgentContext,
   type TestAgentOptions,
   type TestAgentServiceOverride,
+  wireRecordPersistenceServices,
 } from '../../harness';
 import { recordingTelemetry, type TelemetryRecord } from '../../app/telemetry/stubs';
 import { stubFlag } from '../../app/flag/stubs';
 import { IFlagService } from '#/app/flag/flag';
 import { ISessionToolPolicyGate } from '#/session/sessionToolPolicyGate/sessionToolPolicyGate';
 import { ISessionToolPolicy } from '#/session/sessionToolPolicy/sessionToolPolicy';
-import { stubLoopWithHooks, type StubLoop } from '../../agent/loop/stubs';
+import { stubLoopWithHooks, type StubLoop, type StubTurn } from '../../agent/loop/stubs';
 import { stubToolExecutorEvents, type ToolExecutorEventStubs } from '../../agent/toolExecutor/stubs';
 import { stubAgentSwarm } from './stubs';
 import { stubAgentContext } from '../../agent/agentContext/stubs';
@@ -159,29 +156,22 @@ function waitForAbort(signal: AbortSignal): Promise<never> {
 }
 
 function blockingGenerate(): {
-  readonly generate: NonNullable<TestAgentOptions['generate']>;
+  readonly requester: NonNullable<TestAgentOptions['generate']>;
   readonly started: Promise<void>;
   readonly signal: () => AbortSignal;
 } {
   const started = deferred();
   let activeSignal: AbortSignal | undefined;
-  const generate: NonNullable<TestAgentOptions['generate']> = async (
-    _chat,
-    _systemPrompt,
-    _tools,
-    _history,
-    _callbacks,
-    options,
-  ) => {
-    const signal = options?.signal;
-    if (signal === undefined) throw new Error('Expected an LLM abort signal');
-    options?.onRequestStart?.();
-    activeSignal = signal;
-    started.resolve();
-    return waitForAbort(signal);
+  const requester: NonNullable<TestAgentOptions['generate']> = {
+    generate: (_config, _content, control) => {
+      control.onEvent?.({ type: 'llm.sent' });
+      activeSignal = control.signal;
+      started.resolve();
+      return waitForAbort(control.signal);
+    },
   };
   return {
-    generate,
+    requester,
     started: started.promise,
     signal: () => {
       if (activeSignal === undefined) throw new Error('LLM request has not started');
@@ -210,7 +200,7 @@ async function restoreGoalRecords(
   await ctx.restore(records as readonly WireRecord[]);
 }
 
-function makeTurn(id: number): Turn {
+function makeTurn(id: number): StubTurn {
   return {
     id,
     signal: new AbortController().signal,
@@ -220,7 +210,7 @@ function makeTurn(id: number): Turn {
   };
 }
 
-async function runGoalStep(loopService: StubLoop, turn: Turn): Promise<boolean> {
+async function runGoalStep(loopService: StubLoop, turn: StubTurn): Promise<boolean> {
   const step = {
     turnId: turn.id,
     step: 1,
@@ -238,13 +228,13 @@ async function runGoalStep(loopService: StubLoop, turn: Turn): Promise<boolean> 
   };
   await loopService.hooks.onWillBeginStep.run(step);
   await loopService.hooks.onDidFinishStep.run(afterStep);
-  return loopService.queue.takeNextBatch() !== undefined;
+  return loopService.drainNextBatch({ append: () => {} }) !== undefined;
 }
 
 async function recordStepUsage(
   usageService: TestAgentContext['usage'],
   goals: IAgentGoalService,
-  turn: Turn,
+  turn: StubTurn,
   usage: TokenUsage,
 ): Promise<boolean> {
   await usageService.record('mock-model', usage, { type: 'turn', turnId: turn.id, step: 1 });
@@ -253,7 +243,7 @@ async function recordStepUsage(
 
 async function runTerminalUpdateGoalResult(
   toolExecutor: IAgentToolExecutorService,
-  turn: Turn,
+  turn: StubTurn,
   status: 'complete' | 'blocked',
   output: string,
 ): Promise<void> {
@@ -276,7 +266,7 @@ async function runTerminalUpdateGoalResult(
 
 async function executeToolCall(
   toolExecutor: IAgentToolExecutorService,
-  turn: Turn,
+  turn: StubTurn,
   toolCall: ToolCall,
 ): Promise<ToolExecutionResult[]> {
   const results: ToolExecutionResult[] = [];
@@ -291,7 +281,7 @@ async function executeToolCall(
 
 function endTurn(
   eventBus: IEventBus,
-  turn: Turn,
+  turn: StubTurn,
   result: TurnEndedInput = { reason: 'completed' },
 ): void {
   const error = result.error !== undefined ? toKimiErrorPayload(result.error) : undefined;
@@ -885,17 +875,8 @@ describe('AgentGoalService core workflow hooks', () => {
     abortResult = true,
   ): Promise<ReturnType<typeof vi.fn<() => boolean>>> {
     const abort = vi.fn<() => boolean>(() => abortResult);
-    const turn: Turn = { ...makeTurn(41), result: new Promise<never>(() => {}) };
-    const step: Step = {
-      id: 'goal-continuation',
-      turnId: turn.id,
-      state: 'queued',
-      signal: turn.signal,
-      result: Promise.resolve({ type: 'completed' }),
-      cancel: () => true,
-    };
-    const receipt: EnqueueReceipt = { assigned: Promise.resolve({ turn, step }), abort };
-    vi.spyOn(loopService, 'enqueue').mockReturnValue(receipt);
+    const turn: StubTurn = { ...makeTurn(41), result: new Promise<never>(() => {}), cancel: () => abort() };
+    vi.spyOn(loopService, 'submit').mockReturnValue({ turn });
 
     await goals.createGoal({ objective: 'finish the task' });
     await goals.markBlocked({ reason: 'need credentials' });
@@ -1251,14 +1232,14 @@ describe('AgentGoalService core workflow hooks', () => {
   });
 
   it('does not launch a continuation when another loop request is pending', async () => {
-    loopService.enqueue(
-      new MessageStepRequest({
+    loopService.notify({
+      message: {
         role: 'user',
         content: [{ type: 'text', text: 'queued work' }],
         toolCalls: [],
         origin: USER_PROMPT_ORIGIN,
-      }),
-    );
+      },
+    });
     await goals.createGoal({ objective: 'finish the task' });
     await goals.markBlocked({ reason: 'need credentials' });
 
@@ -1303,13 +1284,13 @@ describe('AgentGoalService core workflow hooks', () => {
 
   it('starts a continuation after an opted paused resume waits for a cancelled turn', async () => {
     await startLiveContinuation();
-    const enqueue = vi.mocked(loopService.enqueue);
+    const submit = vi.mocked(loopService.submit);
 
     await goals.pauseGoal();
     const resumed = await goals.resumeGoal({ continueIfPaused: true });
     endTurn(eventBus, makeTurn(41), { reason: 'cancelled' });
 
-    await vi.waitFor(() => expect(enqueue).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(submit).toHaveBeenCalledTimes(2));
     expect(resumed.status).toBe('active');
     expect(goals.getGoal().goal?.status).toBe('active');
   });
@@ -1641,7 +1622,7 @@ describe('AgentGoalService core workflow hooks', () => {
 
   it('pauses the goal when the continuation launch fails', async () => {
     await goals.createGoal({ objective: 'finish the task' });
-    vi.spyOn(loopService, 'enqueue').mockImplementation(() => {
+    vi.spyOn(loopService, 'submit').mockImplementation(() => {
       throw new Error('wire dispatch exploded');
     });
     const updates: GoalUpdated[] = [];
@@ -1844,9 +1825,9 @@ describe('goal pause classification on provider errors', () => {
   }
 
   it('pauses the goal on provider rate limits', async () => {
-    const goal = await goalAfterFailedTurn(async () => {
+    const goal = await goalAfterFailedTurn(requesterFromGenerateFn(async () => {
       throw new APIStatusError(429, 'Rate limited', 'req-429');
-    });
+    }));
 
     expect(goal).toMatchObject({
       status: 'paused',
@@ -1855,9 +1836,9 @@ describe('goal pause classification on provider errors', () => {
   });
 
   it('pauses the goal on provider connection errors', async () => {
-    const goal = await goalAfterFailedTurn(async () => {
+    const goal = await goalAfterFailedTurn(requesterFromGenerateFn(async () => {
       throw new APIConnectionError('socket hang up');
-    });
+    }));
 
     expect(goal).toMatchObject({
       status: 'paused',
@@ -1866,9 +1847,9 @@ describe('goal pause classification on provider errors', () => {
   });
 
   it('pauses the goal on provider authentication errors', async () => {
-    const goal = await goalAfterFailedTurn(async () => {
+    const goal = await goalAfterFailedTurn(requesterFromGenerateFn(async () => {
       throw new APIStatusError(401, 'Unauthorized', 'req-401');
-    });
+    }));
 
     expect(goal).toMatchObject({
       status: 'paused',
@@ -1877,9 +1858,9 @@ describe('goal pause classification on provider errors', () => {
   });
 
   it('pauses the goal on model configuration errors', async () => {
-    const goal = await goalAfterFailedTurn(async () => {
+    const goal = await goalAfterFailedTurn(requesterFromGenerateFn(async () => {
       throw new Error2(ErrorCodes.MODEL_NOT_CONFIGURED, 'Model not set');
-    });
+    }));
 
     expect(goal).toMatchObject({
       status: 'paused',
@@ -1888,7 +1869,7 @@ describe('goal pause classification on provider errors', () => {
   });
 
   it('pauses the goal on provider safety policy blocks', async () => {
-    const goal = await goalAfterFailedTurn(async () => ({
+    const goal = await goalAfterFailedTurn(requesterFromGenerateFn(async () => ({
       id: 'mock-filtered',
       message: {
         role: 'assistant',
@@ -1898,7 +1879,7 @@ describe('goal pause classification on provider errors', () => {
       usage: { inputOther: 0, output: 0, inputCacheRead: 0, inputCacheCreation: 0 },
       finishReason: 'filtered',
       rawFinishReason: 'content_filter',
-    }));
+    })));
 
     expect(goal).toMatchObject({
       status: 'paused',
@@ -1912,7 +1893,7 @@ describe('AgentGoalService hard wall-clock deadline', () => {
     const clock = new ManualGoalDeadlineScheduler();
     const llm = blockingGenerate();
     const ctx = createTestAgent(appService(IGoalDeadlineScheduler, clock), {
-      generate: llm.generate,
+      generate: llm.requester,
     });
     try {
       ctx.configure();
@@ -2007,7 +1988,7 @@ describe('AgentGoalService hard wall-clock deadline', () => {
     const clock = new ManualGoalDeadlineScheduler();
     const llm = blockingGenerate();
     const ctx = createTestAgent(appService(IGoalDeadlineScheduler, clock), {
-      generate: llm.generate,
+      generate: llm.requester,
     });
     try {
       ctx.configure();

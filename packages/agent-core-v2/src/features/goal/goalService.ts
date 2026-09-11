@@ -21,9 +21,8 @@ import {
   IAgentLoopService,
   type AfterStepContext,
   type BeforeStepContext,
-  type EnqueueReceipt,
+  type Turn,
 } from '#/agent/loop/loop';
-import { ContinuationStepRequest, MessageStepRequest } from '#/agent/loop/stepRequest';
 import { TurnStarted } from '#/agent/loop/turnEvents';
 import { TurnEnded } from '#/agent/loop/turnOps';
 import { IAgentPermissionModeService } from '#/agent/permissionMode/permissionMode';
@@ -177,7 +176,7 @@ export interface GoalRuntimeState {
 }
 
 interface PendingContinuation {
-  readonly receipt: EnqueueReceipt;
+  readonly turn: Turn;
   readonly goalId: string;
   turnId?: number;
 }
@@ -498,6 +497,11 @@ function handleTurnLaunched(context: GoalOperationContext, turnId: number, origi
   context.effects.liveTurnId = turnId;
   context.effects.goalTurnTargets.delete(turnId);
   context.effects.exhaustedTurnBudgetGoals.delete(turnId);
+  const pending = context.effects.pendingContinuation;
+  if (pending !== undefined && pending.turnId === undefined && isGoalContinuationOrigin(origin)) {
+    pending.turnId = turnId;
+    context.effects.pendingContinuationGoals.set(turnId, pending.goalId);
+  }
   if (!context.effects.goalDrivenTurns.has(turnId)) {
     const state = context.runtime.getState().goal;
     const continuationGoalId = isGoalContinuationOrigin(origin)
@@ -600,7 +604,7 @@ function enqueueGoalOutcomeContinuation(context: GoalOperationContext, ctx: Afte
   context.effects.goalOutcomeContinuationTurns.add(ctx.turnId);
   const maxSteps = context.runtime.get(IConfigService).get<LoopControl>(LOOP_CONTROL_SECTION)?.maxStepsPerTurn;
   if (!hasStepBudgetRemaining(maxSteps, ctx.step)) return;
-  context.runtime.get(IAgentLoopService).enqueue(new ContinuationStepRequest());
+  context.runtime.get(IAgentLoopService).notify();
 }
 
 async function handleTurnEnded(context: GoalOperationContext,
@@ -723,25 +727,14 @@ function launchContinuationTurn(context: GoalOperationContext, goalId: string, s
     toolCalls: [],
     origin: GOAL_CONTINUATION_ORIGIN,
   };
-  const request = new MessageStepRequest(message, {
-    kind: 'goal_continuation',
-    admission: 'newTurn',
-  });
-  const receipt = context.runtime.get(IAgentLoopService).enqueue(request);
-  const pending: PendingContinuation = { receipt, goalId };
+  const { turn } = context.runtime.get(IAgentLoopService).submit({ message });
+  const pending: PendingContinuation = { turn, goalId };
   context.effects.pendingContinuation = pending;
-  void receipt.assigned
-    .then(({ turn }) => {
-      pending.turnId = turn.id;
-      if (!context.effects.goalDrivenTurns.has(turn.id)) {
-        context.effects.pendingContinuationGoals.set(turn.id, pending.goalId);
-      }
-      return turn.result;
-    })
-    .finally(() => {
-      if (pending.turnId !== undefined) context.effects.pendingContinuationGoals.delete(pending.turnId);
-      if (context.effects.pendingContinuation === pending) context.effects.pendingContinuation = undefined;
-    });
+  void turn.ready.then(() => { pending.turnId = turn.id; }).catch(() => undefined);
+  void turn.result.finally(() => {
+    if (pending.turnId !== undefined) context.effects.pendingContinuationGoals.delete(pending.turnId);
+    if (context.effects.pendingContinuation === pending) context.effects.pendingContinuation = undefined;
+  });
 }
 
 function canLaunchContinuation(context: GoalOperationContext): boolean {
@@ -775,8 +768,8 @@ function cancelPendingContinuation(context: GoalOperationContext,
   if (preserveLiveContinuation && pending?.turnId === context.effects.liveTurnId) return;
   context.effects.pendingContinuation = undefined;
   const cancellation = reason ?? abortError('Goal continuation cancelled');
-  const aborted = pending?.receipt.abort(cancellation);
-  if (pending !== undefined && !aborted && pending.turnId !== undefined) {
+  const cancelled = pending?.turn.cancel(cancellation) ?? false;
+  if (pending !== undefined && !cancelled && pending.turnId !== undefined) {
     context.runtime.get(IAgentLoopService).cancel(pending.turnId, cancellation);
   }
 }

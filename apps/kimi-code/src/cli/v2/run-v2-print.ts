@@ -12,8 +12,6 @@
  *     `Turn.result` for authoritative completion,
  *   - applies the print-mode background policy (config-driven, v1-aligned:
  *     `exit` / `drain` / `steer`) before exiting.
- *
- * Selected by `runPrompt` unless `KIMI_CODE_LEGACY_FLAG` is truthy.
  */
 
 import { readFile } from 'node:fs/promises';
@@ -32,10 +30,12 @@ import {
   IConfigService,
   IEventBus,
   IEventDispatcher,
+  IHostFileSystem,
   IOAuthToolkit,
   ISessionIndex,
   ISessionManager,
   ITelemetryService,
+  IWorkspaceInstanceManager,
   PRINT_MAX_TURNS_DEFAULT,
   PRINT_WAIT_CEILING_S_DEFAULT,
   applyPrintModeConfigDefaults,
@@ -55,9 +55,14 @@ import {
   type IAgentScopeHandle,
   type ISessionScopeHandle,
   type LoopRunResult,
+  type McpServerConfig,
   type PrintBackgroundMode,
   type Scope,
 } from '@moonshot-ai/agent-core-v2';
+import {
+  loadMcpServersDetailed,
+  resolveMcpJsonPaths,
+} from '@moonshot-ai/agent-core-v2/app/mcpConfig/configLoader';
 import {
   createKimiDefaultHeaders,
   createKimiDeviceId,
@@ -78,7 +83,7 @@ import type {
   ThinkingDelta,
   ToolCallDelta,
 } from '@moonshot-ai/agent-core-v2/agent/loop/turnEvents';
-import type { TurnStepRetrying } from '@moonshot-ai/agent-core-v2/agent/stepRetry/stepRetryService';
+import type { TurnStepRetrying } from '@moonshot-ai/agent-core-v2/agent/loop/turnEvents';
 import type { HookResult } from '@moonshot-ai/agent-core-v2/features/externalHooks/agent/agentExternalHooksService';
 import type {
   ToolCallStarted,
@@ -269,7 +274,17 @@ export async function runV2Print(
         endpoint: () => currentKimiProfile().telemetryEndpoint,
         getAccessToken: async () =>
           (await auth.getCachedAccessToken(KIMI_CODE_PROVIDER_NAME)) ?? null,
+        onUnexpectedError: (error) => console.error('[unexpected]', error),
       });
+    }
+
+    // Print mode has no trust prompt, so the engine's workspace-trust gate
+    // would silently drop project-level MCP servers — say so on stderr.
+    try {
+      const gated = await listTrustGatedMcpServers(app, workDir, homeDir);
+      if (gated.length > 0) stderr.write(formatTrustGatedMcpWarning(gated));
+    } catch {
+      // Best-effort: a broken mcp.json or trust store must not fail the run.
     }
 
     const resolved = await resolveNativeSession(app, opts, workDir, defaultModel, stderr);
@@ -474,6 +489,55 @@ async function resolveNativeSession(
   };
 }
 
+export interface TrustGatedMcpServer {
+  readonly name: string;
+  readonly target: string;
+}
+
+/**
+ * Project-level MCP servers the workspace-trust gate leaves out in this
+ * folder, identified by the origin of each entry in the final merged config
+ * (mirrors the SDK's `getWorkspaceTrustInfo`). Empty when the folder is trusted
+ * or nothing project-level is declared.
+ */
+export async function listTrustGatedMcpServers(
+  app: Scope,
+  workDir: string,
+  homeDir: string,
+): Promise<readonly TrustGatedMcpServer[]> {
+  const workspace = await app.accessor
+    .get(IWorkspaceInstanceManager)
+    .getOrCreate({ root: workDir });
+  if (await workspace.program.trust.get()) return [];
+  const fs = app.accessor.get(IHostFileSystem);
+  const [paths, loaded] = await Promise.all([
+    resolveMcpJsonPaths({ fs, cwd: workDir, homeDir }),
+    loadMcpServersDetailed({ fs, cwd: workDir, homeDir, includeProject: true }),
+  ]);
+  const projectPaths = new Set([paths.projectRoot, paths.project]);
+  return Object.entries(loaded.servers)
+    .filter(([name]) => projectPaths.has(loaded.origins[name] ?? ''))
+    .map(([name, config]) => ({ name, target: describeMcpTarget(config) }))
+    .toSorted((a, b) => a.name.localeCompare(b.name));
+}
+
+export function formatTrustGatedMcpWarning(servers: readonly TrustGatedMcpServer[]): string {
+  const noun = servers.length === 1 ? 'server' : 'servers';
+  const list = servers.map((server) => `${server.name} (${server.target})`).join(', ');
+  return (
+    `Warning: this folder is not trusted; skipped ${servers.length} project-level MCP ${noun}: ${list}.\n` +
+    '  Run `kimi` here and choose "Trust this folder" to enable them.\n\n'
+  );
+}
+
+function describeMcpTarget(config: McpServerConfig): string {
+  if (config.transport === 'stdio') {
+    const args = config.args === undefined ? '' : ` ${config.args.join(' ')}`;
+    return `stdio: ${config.command}${args}`;
+  }
+  return `${config.transport}: ${config.url}`;
+}
+
 async function runNativeTurn(
   app: Scope,
   session: ISessionScopeHandle,
@@ -526,6 +590,10 @@ async function runNativeTurn(
     // final message.
     writer.flushAssistant();
     if (result.type === 'completed') {
+      const skipTurnId = turn.id;
+      if (skipTurnId === undefined) {
+        throw new Error('Prompt turn ended before it started');
+      }
       const configService = app.accessor.get(IConfigService);
       const taskConfig = resolveAgentTaskConfig(configService);
       const goalService = agent.accessor.get(IAgentGoalService);
@@ -538,7 +606,7 @@ async function runNativeTurn(
           countPending: () => countPendingBackgroundTasks(session),
           drain: () => drainBackgroundTasks(session, taskConfig?.printWaitCeilingS),
           turnEndings,
-          skipTurnId: turn.id,
+          skipTurnId,
           warn: (message) => stderr.write(`Warning: ${message}\n`),
           now: () => Date.now(),
           goalActive: () => goalService.getGoal().goal?.status === 'active',
@@ -948,7 +1016,7 @@ async function quiesceSessionAgents(
   for (;;) {
     await Promise.allSettled(promptServices.map((service) => service.drain()));
     for (const loop of loops) {
-      for (const turnId of loop.status().pendingTurnIds) loop.cancel(turnId);
+      for (const queueId of loop.status().pendingPromptIds) loop.cancelQueued(queueId);
       loop.cancel();
     }
     await Promise.allSettled(loops.map((loop) => loop.settled()));

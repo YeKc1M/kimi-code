@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 
+import { join, normalize } from 'pathe';
 import { parse as parseToml } from 'smol-toml';
 
 import { type CollectionView } from '#/_base/di/collection';
@@ -7,10 +8,12 @@ import { Disposable } from '#/_base/di/lifecycle';
 import { LifecycleScope } from '#/app/scopes';
 import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import { Emitter, type Event } from '#/_base/event';
+import { TimeoutTimer } from '#/_base/utils/timer';
 import { BugIndicatingError, Error2, ErrorCodes, onUnexpectedError } from '#/errors';
 import { IBootstrapService } from '#/app/bootstrap/bootstrap';
 import { ILogService } from '#/_base/log/log';
 import { IAtomicTomlDocumentStore } from '#/persistence/interface/atomicDocumentStore';
+import { watch } from '#human/utils/watch';
 
 import {
   type AnyEnvBindings,
@@ -40,7 +43,6 @@ import {
 } from './configSectionContributions';
 import { getConfigOverlayContributions } from './configOverlayContributions';
 import { collectKeyDeprecations } from './deprecations';
-import { migrateThinkingEffortMaxToHigh } from './migrations';
 import {
   applySectionToToml,
   camelToSnake,
@@ -52,6 +54,7 @@ import {
 import { planConfigWriteback } from './tomlWriteback';
 
 const CONFIG_SCOPE = '';
+const WATCH_DEBOUNCE_MS = 150;
 
 type GetEnv = (name: string) => string | undefined;
 
@@ -120,7 +123,7 @@ function applyEnvBindings(
   }
 }
 
-function applySectionEnv(
+export function applySectionEnv(
   base: unknown,
   env: AnyEnvBindings,
   getEnv: GetEnv,
@@ -148,7 +151,8 @@ function isSameSection(
     existing.fromToml === options.fromToml &&
     existing.toToml === options.toToml &&
     deepEqual(existing.defaultValue, options.defaultValue) &&
-    deepEqual(existing.deprecations, options.deprecations)
+    deepEqual(existing.deprecations, options.deprecations) &&
+    existing.collectDiagnostics === options.collectDiagnostics
   );
 }
 
@@ -246,6 +250,7 @@ export class ConfigRegistry extends Disposable implements IConfigRegistry {
       fromToml: options.fromToml,
       toToml: options.toToml,
       deprecations: options.deprecations,
+      collectDiagnostics: options.collectDiagnostics,
     });
     this._onDidRegisterSection.fire({ domain });
   }
@@ -301,6 +306,7 @@ export class ConfigService extends Disposable implements IConfigService {
   readonly ready: Promise<void>;
 
   private stateChain: Promise<unknown> = Promise.resolve();
+  private readonly watchDebounce = this._register(new TimeoutTimer());
 
   private rawSnake: ResolvedConfig = {};
   private raw: ResolvedConfig = {};
@@ -327,13 +333,16 @@ export class ConfigService extends Disposable implements IConfigService {
     const { configKey } = this;
     const { homeDir } = this.bootstrap;
     this.seedInitialLoad();
-    this.ready = (async () => {
-      await migrateThinkingEffortMaxToHigh(this.documentStore, configKey, homeDir);
-      await this.load('load');
-    })();
+    this.ready = this.load('load');
+    const configFile = join(homeDir, configKey);
+    const handle = watch(homeDir, { depth: 0 });
+    this._register(handle);
     this._register(
-      this.documentStore.watch(CONFIG_SCOPE, this.configKey)(() => {
-        void this.reload();
+      handle.onDidChange((change) => {
+        if (normalize(change.path) !== normalize(configFile)) return;
+        this.watchDebounce.cancelAndSet(() => {
+          void this.reload();
+        }, WATCH_DEBOUNCE_MS);
       }),
     );
   }
@@ -568,6 +577,13 @@ export class ConfigService extends Disposable implements IConfigService {
     const nextRawSnake = cloneRecord(fileData);
     for (const diagnostic of collectKeyDeprecations(nextRawSnake, this.registry.listSections())) {
       this.pushDiagnostic(diagnostic);
+    }
+    for (const section of this.registry.listSections()) {
+      if (section.collectDiagnostics === undefined) continue;
+      const rawSection = nextRawSnake[camelToSnake(section.domain)];
+      for (const diagnostic of section.collectDiagnostics(rawSection)) {
+        this.pushDiagnostic(diagnostic);
+      }
     }
     if (source !== 'load' && JSON.stringify(nextRawSnake) === JSON.stringify(this.rawSnake)) {
       const scratch = { ...this.validated };

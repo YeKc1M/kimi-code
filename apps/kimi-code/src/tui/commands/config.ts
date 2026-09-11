@@ -402,7 +402,7 @@ async function performModelSwitch(
   persist: boolean,
 ): Promise<void> {
   let session = host.session;
-  if (session === undefined && host.engineV2) {
+  if (session === undefined) {
     // A first prompt may still be inside lazy creation: wait it out so the
     // switch lands on the new session instead of being overwritten by its
     // assembly.
@@ -711,7 +711,7 @@ export async function applyExperimentalFeatureChanges(
     setExperimentalFeatures(features);
     host.refreshSlashCommandAutocomplete();
     host.restoreEditor();
-    if (host.session !== undefined) {
+    if (host.session !== undefined && changes.some((change) => change.id !== 'notify_user')) {
       const reloadedSession = await host.harness.reloadSession({ id: host.session.id });
       await host.reloadCurrentSessionView(
         reloadedSession,
@@ -719,6 +719,14 @@ export async function applyExperimentalFeatureChanges(
       );
     } else {
       host.showStatus('Experimental features updated.', 'success');
+    }
+    if (
+      host.session !== undefined &&
+      changes.some((change) => change.id === 'notify_user' && change.enabled)
+    ) {
+      host.showNotice(
+        'Start a new session to use Updates if this session was created with the feature disabled.',
+      );
     }
     if (changes.some((change) => change.id === 'tower')) {
       // TowerFeature assembles its tool/profile contributions once at App
@@ -805,9 +813,6 @@ async function applyPermissionChoice(host: SlashCommandHost, mode: PermissionMod
   try {
     if (host.session !== undefined) {
       await host.session.setPermission(mode);
-    } else if (!host.engineV2) {
-      host.showError(NO_ACTIVE_SESSION_MESSAGE);
-      return;
     }
     // v2 session-less: the chosen mode is recorded in appState and passed to
     // the lazy-created session.
