@@ -24,7 +24,9 @@ import { IAgentRuntimeService } from '#/agent/runtimeBinding/agentRuntime';
 import { ToolAccesses, type ExecutableTool } from '#/tool/toolContract';
 import { IAgentToolRegistryService } from '#/agent/toolRegistry/toolRegistry';
 import { IAgentLoopService } from '#/agent/loop/loop';
-import { IAgentScopeContext } from '#/agent/scopeContext/scopeContext';
+import { agentContextOf, IAgentScopeContext } from '#/agent/scopeContext/scopeContext';
+import { createActor } from '#human/xstate2';
+import { createAgentMachine } from '#human/agent/machine';
 import { IAgentUserToolService, type UserToolRegistration } from '#/agent/userTool/userTool';
 import {
   AgentSwarmToolInputSchema,
@@ -100,7 +102,6 @@ import {
 } from '../harness';
 import { executeTool } from '../tools/fixtures/execute-tool';
 import { stubAgentContext } from '../agent/agentContext/stubs';
-import { agentContextOf } from '#/agent/scopeContext/scopeContext';
 import { TOWER_WORKER_PROFILE } from '#/features/tower/tower';
 
 const signal = new AbortController().signal;
@@ -351,9 +352,6 @@ function createAgentLifecycleStub(options: AgentLifecycleStubOptions = {}): Agen
               publishedEvents.push(event);
               return Promise.resolve();
             },
-            history: () => [],
-            checkpointDepth: () => 0,
-            undo: () => {},
             restore: () => Promise.resolve(),
             flush: () => Promise.resolve(),
           } as never;
@@ -428,6 +426,23 @@ function createAgentLifecycleStub(options: AgentLifecycleStubOptions = {}): Agen
     adopt: vi.fn((adopted) => {
       const adoptedHandle = adopted as IAgentScopeHandle;
       handles.set(adoptedHandle.id, adoptedHandle);
+      const loop = adoptedHandle.accessor.get(IAgentLoopService);
+      const bundle = loop.buildAttachBundle();
+      const ref = createActor(createAgentMachine({}), {
+        input: {
+          request: bundle.request,
+          scopeFactory: () =>
+            Promise.resolve({
+              store: bundle.store,
+              turnLogic: bundle.turnLogic,
+              toolLogic: bundle.toolLogic,
+              tools: bundle.tools,
+              request: bundle.request,
+            }),
+        },
+      });
+      ref.start();
+      loop.attachEngine(ref, bundle);
       return agentContextOf(adoptedHandle);
     }),
     broadcastPermissionMode: vi.fn(),
@@ -4313,7 +4328,9 @@ describe('Agent tools', () => {
         [emit] prompt.started              { "time": "<time>", "agentId": "main", "promptId": "<msg-1>" }
         [emit] context.spliced             { "time": "<time>", "agentId": "main", "start": 1, "deleteCount": 0, "messages": [ { "role": "user", "content": [ { "type": "text", "text": "<auto-mode-enter-reminder>" } ], "toolCalls": [], "origin": { "kind": "injection", "variant": "permission_mode" } } ] }
         [wire] context.append_message      { "agentId": "main", "message": { "role": "user", "content": [ { "type": "text", "text": "Look up moon" } ], "toolCalls": [], "origin": { "kind": "user" }, "id": "<msg-1>" }, "time": "<time>" }
+        [wire] agent.message.appended      { "message": { "message": { "role": "user", "content": [ { "type": "text", "text": "Look up moon" } ] }, "meta": { "source": "input" } }, "time": "<time>", "kind": "event" }
         [wire] context.append_message      { "agentId": "main", "message": { "role": "user", "content": [ { "type": "text", "text": "<auto-mode-enter-reminder>" } ], "toolCalls": [], "origin": { "kind": "injection", "variant": "permission_mode" } }, "time": "<time>" }
+        [wire] agent.turn.started          { "turnId": 0, "queueItemId": "<msg-1>", "time": "<time>", "kind": "event" }
         [wire] plugin.session_start        { "agentId": "main", "content": null, "time": "<time>" }
         [emit] turn.step.started           { "time": "<time>", "agentId": "main", "turnId": 0, "step": 1, "stepId": "<uuid-1>" }
         [wire] context.append_loop_event   { "agentId": "main", "event": { "type": "step.begin", "uuid": "<uuid-1>", "turnId": "0", "step": 1 }, "time": "<time>" }
@@ -4357,6 +4374,10 @@ describe('Agent tools', () => {
         [emit] turn.step.completed         { "time": "<time>", "agentId": "main", "turnId": 0, "step": 2, "stepId": "<uuid-4>", "usage": { "inputOther": 164, "output": 12, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finishReason": "end_turn", "providerFinishReason": "completed", "rawFinishReason": "stop" }
         [wire] context.append_loop_event   { "agentId": "main", "event": { "type": "content.part", "uuid": "<uuid-5>", "turnId": "0", "step": 2, "stepUuid": "<uuid-4>", "part": { "type": "text", "text": "The lookup result is moon-result." } }, "time": "<time>" }
         [wire] context.append_loop_event   { "agentId": "main", "event": { "type": "step.end", "uuid": "<uuid-4>", "turnId": "0", "step": 2, "finishReason": "end_turn", "usage": { "inputOther": 164, "output": 12, "inputCacheRead": 0, "inputCacheCreation": 0 }, "messageId": "mock-2", "providerFinishReason": "completed", "rawFinishReason": "stop" }, "time": "<time>" }
+        [wire] agent.message.appended      { "message": { "message": { "role": "assistant", "content": [ { "type": "text", "text": "I will look it up." } ], "toolCalls": [ { "type": "function", "id": "call_lookup", "name": "Lookup", "arguments": "{\\"query\\":\\"moon\\"}" } ] }, "meta": { "model": { "provider": "agent-loop", "model": "agent-loop" }, "source": "llm", "usage": { "inputOther": 144, "output": 16, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finish": { "finishReason": "tool_calls", "rawFinishReason": "tool_calls" }, "messageId": "mock-1" } }, "time": "<time>", "kind": "event" }
+        [wire] agent.message.appended      { "message": { "message": { "role": "tool", "content": [ { "type": "text", "text": "moon-result" } ], "toolCallId": "call_lookup" }, "meta": { "source": "tool" } }, "time": "<time>", "kind": "event" }
+        [wire] agent.message.appended      { "message": { "message": { "role": "assistant", "content": [ { "type": "text", "text": "The lookup result is moon-result." } ], "toolCalls": [] }, "meta": { "model": { "provider": "agent-loop", "model": "agent-loop" }, "source": "llm", "usage": { "inputOther": 164, "output": 12, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finish": { "finishReason": "completed", "rawFinishReason": "stop" }, "messageId": "mock-2" } }, "time": "<time>", "kind": "event" }
+        [wire] agent.turn.ended            { "turnId": 0, "outcome": "done", "time": "<time>", "kind": "event" }
         [wire] turn.ended                  { "agentId": "main", "turnId": 0, "reason": "completed", "time": "<time>" }
         [emit] turn.ended                  { "time": "<time>", "agentId": "main", "turnId": 0, "reason": "completed" }
       `);
@@ -4384,6 +4405,8 @@ describe('Agent tools', () => {
         [emit] context.spliced                { "time": "<time>", "agentId": "main", "start": 5, "deleteCount": 0, "messages": [ { "role": "user", "content": [ { "type": "text", "text": "Can you still use Lookup?" } ], "toolCalls": [], "origin": { "kind": "user" }, "id": "<msg-2>" } ] }
         [emit] prompt.started                 { "time": "<time>", "agentId": "main", "promptId": "<msg-2>" }
         [wire] context.append_message         { "agentId": "main", "message": { "role": "user", "content": [ { "type": "text", "text": "Can you still use Lookup?" } ], "toolCalls": [], "origin": { "kind": "user" }, "id": "<msg-2>" }, "time": "<time>" }
+        [wire] agent.message.appended         { "message": { "message": { "role": "user", "content": [ { "type": "text", "text": "Can you still use Lookup?" } ] }, "meta": { "source": "input" } }, "time": "<time>", "kind": "event" }
+        [wire] agent.turn.started             { "turnId": 1, "queueItemId": "<msg-2>", "time": "<time>", "kind": "event" }
         [emit] turn.step.started              { "time": "<time>", "agentId": "main", "turnId": 1, "step": 1, "stepId": "<uuid-6>" }
         [wire] context.append_loop_event      { "agentId": "main", "event": { "type": "step.begin", "uuid": "<uuid-6>", "turnId": "1", "step": 1 }, "time": "<time>" }
         [emit] assistant.delta                { "time": "<time>", "agentId": "main", "turnId": 1, "delta": "No lookup tool is available." }
@@ -4396,6 +4419,8 @@ describe('Agent tools', () => {
         [wire] token_counting.measured        { "agentId": "main", "length": 7, "tokens": 194, "time": "<time>" }
         [wire] context.append_loop_event      { "agentId": "main", "event": { "type": "content.part", "uuid": "<uuid-7>", "turnId": "1", "step": 1, "stepUuid": "<uuid-6>", "part": { "type": "text", "text": "No lookup tool is available." } }, "time": "<time>" }
         [wire] context.append_loop_event      { "agentId": "main", "event": { "type": "step.end", "uuid": "<uuid-6>", "turnId": "1", "step": 1, "finishReason": "end_turn", "usage": { "inputOther": 184, "output": 10, "inputCacheRead": 0, "inputCacheCreation": 0 }, "messageId": "mock-3", "providerFinishReason": "completed", "rawFinishReason": "stop" }, "time": "<time>" }
+        [wire] agent.message.appended         { "message": { "message": { "role": "assistant", "content": [ { "type": "text", "text": "No lookup tool is available." } ], "toolCalls": [] }, "meta": { "model": { "provider": "agent-loop", "model": "agent-loop" }, "source": "llm", "usage": { "inputOther": 184, "output": 10, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finish": { "finishReason": "completed", "rawFinishReason": "stop" }, "messageId": "mock-3" } }, "time": "<time>", "kind": "event" }
+        [wire] agent.turn.ended               { "turnId": 1, "outcome": "done", "time": "<time>", "kind": "event" }
         [wire] turn.ended                     { "agentId": "main", "turnId": 1, "reason": "completed", "time": "<time>" }
         [emit] turn.ended                     { "time": "<time>", "agentId": "main", "turnId": 1, "reason": "completed" }
       `);

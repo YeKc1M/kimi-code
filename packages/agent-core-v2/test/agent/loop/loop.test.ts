@@ -5,6 +5,7 @@ import { emptyUsage } from '#human/llm/usage';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { IDisposable } from '#/_base/di/lifecycle';
+import { Event } from '#/_base/event';
 import { IAgentProfileService } from '#/index';
 import { IAgentLLMRequesterService } from '#/agent/llmRequester/llmRequester';
 import type { ModelRequestTiming } from '#/llm-adapter/model/model-requester';
@@ -13,6 +14,14 @@ import type { ContextMessage } from '#/agent/contextMemory/types';
 import type { LoopRecordedEvent } from '#/agent/contextMemory/loopEventFold';
 import { IAgentGoalService } from '#/features/goal/goalService';
 import { IAgentLoopService, type Turn } from '#/agent/loop/loop';
+import { createActor } from '#human/xstate2';
+import { createAgentMachine } from '#human/agent/machine';
+import { agentContextOf } from '#/agent/scopeContext/scopeContext';
+import type { AgentContext } from '#/agent/agentContext/agentContext';
+import {
+  IAgentLifecycleService,
+  type AgentScopeCreatedEvent,
+} from '#/session/agentLifecycle/agentLifecycle';
 import {
   AssistantDelta,
   ThinkingDelta,
@@ -31,8 +40,11 @@ import { userCancellationReason } from '#/_base/utils/abort';
 import {
   agentService,
   createTestAgent,
+  InMemoryWireRecordPersistence,
   permissionModeServices,
   requesterFromGenerateFn,
+  sessionService,
+  wireRecordPersistenceServices,
   type TestAgentContext,
   type TestAgentOptions,
 } from '../../harness';
@@ -81,6 +93,8 @@ describe('Agent loop', () => {
       [emit] context.spliced             { "time": "<time>", "agentId": "main", "start": 0, "deleteCount": 0, "messages": [ { "role": "user", "content": [ { "type": "text", "text": "Hello" } ], "toolCalls": [], "origin": { "kind": "user" }, "id": "<msg-1>" } ] }
       [emit] prompt.started              { "time": "<time>", "agentId": "main", "promptId": "<msg-1>" }
       [wire] context.append_message      { "agentId": "main", "message": { "role": "user", "content": [ { "type": "text", "text": "Hello" } ], "toolCalls": [], "origin": { "kind": "user" }, "id": "<msg-1>" }, "time": "<time>" }
+      [wire] agent.message.appended      { "message": { "message": { "role": "user", "content": [ { "type": "text", "text": "Hello" } ] }, "meta": { "source": "input" } }, "time": "<time>", "kind": "event" }
+      [wire] agent.turn.started          { "turnId": 0, "queueItemId": "<msg-1>", "time": "<time>", "kind": "event" }
       [wire] plugin.session_start        { "agentId": "main", "content": null, "time": "<time>" }
       [emit] turn.step.started           { "time": "<time>", "agentId": "main", "turnId": 0, "step": 1, "stepId": "<uuid-1>" }
       [wire] context.append_loop_event   { "agentId": "main", "event": { "type": "step.begin", "uuid": "<uuid-1>", "turnId": "0", "step": 1 }, "time": "<time>" }
@@ -98,6 +112,8 @@ describe('Agent loop', () => {
       [wire] context.append_loop_event   { "agentId": "main", "event": { "type": "content.part", "uuid": "<uuid-2>", "turnId": "0", "step": 1, "stepUuid": "<uuid-1>", "part": { "type": "think", "think": "<think-1>" } }, "time": "<time>" }
       [wire] context.append_loop_event   { "agentId": "main", "event": { "type": "content.part", "uuid": "<uuid-3>", "turnId": "0", "step": 1, "stepUuid": "<uuid-1>", "part": { "type": "text", "text": "<text-1><text-2>" } }, "time": "<time>" }
       [wire] context.append_loop_event   { "agentId": "main", "event": { "type": "step.end", "uuid": "<uuid-1>", "turnId": "0", "step": 1, "finishReason": "end_turn", "usage": { "inputOther": 3, "output": 10, "inputCacheRead": 0, "inputCacheCreation": 0 }, "messageId": "mock-1", "providerFinishReason": "completed", "rawFinishReason": "stop" }, "time": "<time>" }
+      [wire] agent.message.appended      { "message": { "message": { "role": "assistant", "content": [ { "type": "think", "think": "<think-1>" }, { "type": "text", "text": "<text-1><text-2>" } ], "toolCalls": [] }, "meta": { "model": { "provider": "agent-loop", "model": "agent-loop" }, "source": "llm", "usage": { "inputOther": 3, "output": 10, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finish": { "finishReason": "completed", "rawFinishReason": "stop" }, "messageId": "mock-1" } }, "time": "<time>", "kind": "event" }
+      [wire] agent.turn.ended            { "turnId": 0, "outcome": "done", "time": "<time>", "kind": "event" }
       [wire] turn.ended                  { "agentId": "main", "turnId": 0, "reason": "completed", "time": "<time>" }
       [emit] turn.ended                  { "time": "<time>", "agentId": "main", "turnId": 0, "reason": "completed" }
     `);
@@ -122,6 +138,41 @@ describe('Agent loop', () => {
     expect(record?.['time']).toEqual(expect.any(Number));
   });
 
+  it('restores the engine turn clock from the machine journal on resume', async () => {
+    profile.update({ activeToolNames: [] });
+    ctx.mockNextResponse({ type: 'text', text: 'first answer' });
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'first prompt' }] });
+    await ctx.untilTurnEnd();
+
+    const records = await ctx.persistedWireRecords();
+    expect(records.some((record) => record.type === 'agent.turn.ended')).toBe(true);
+
+    const resumed = createTestAgent(
+      wireRecordPersistenceServices(new InMemoryWireRecordPersistence(records)),
+    );
+    try {
+      await resumed.restorePersisted();
+      const turnIds: number[] = [];
+      const subscription = resumed
+        .get(IEventBus)
+        .subscribe(TurnStarted, (event) => turnIds.push(event.turnId));
+      resumed.mockNextResponse({ type: 'text', text: 'second answer' });
+      await resumed.rpc.prompt({ input: [{ type: 'text', text: 'second prompt' }] });
+      await resumed.untilTurnEnd();
+      subscription.dispose();
+
+      expect(turnIds).toEqual([1]);
+      const persisted = await resumed.persistedWireRecords();
+      expect(
+        persisted
+          .filter((record) => record.type === 'agent.turn.ended')
+          .map((record) => record['turnId']),
+      ).toEqual([0, 1]);
+    } finally {
+      await resumed.dispose();
+    }
+  });
+
   it('fails the turn after a filtered step completes', async () => {
     ctx.mockNextProviderResponse({
       parts: [{ type: 'text', text: 'blocked' }],
@@ -138,6 +189,8 @@ describe('Agent loop', () => {
       [emit] context.spliced             { "time": "<time>", "agentId": "main", "start": 0, "deleteCount": 0, "messages": [ { "role": "user", "content": [ { "type": "text", "text": "Hello" } ], "toolCalls": [], "origin": { "kind": "user" }, "id": "<msg-1>" } ] }
       [emit] prompt.started              { "time": "<time>", "agentId": "main", "promptId": "<msg-1>" }
       [wire] context.append_message      { "agentId": "main", "message": { "role": "user", "content": [ { "type": "text", "text": "Hello" } ], "toolCalls": [], "origin": { "kind": "user" }, "id": "<msg-1>" }, "time": "<time>" }
+      [wire] agent.message.appended      { "message": { "message": { "role": "user", "content": [ { "type": "text", "text": "Hello" } ] }, "meta": { "source": "input" } }, "time": "<time>", "kind": "event" }
+      [wire] agent.turn.started          { "turnId": 0, "queueItemId": "<msg-1>", "time": "<time>", "kind": "event" }
       [wire] plugin.session_start        { "agentId": "main", "content": null, "time": "<time>" }
       [emit] turn.step.started           { "time": "<time>", "agentId": "main", "turnId": 0, "step": 1, "stepId": "<uuid-1>" }
       [wire] context.append_loop_event   { "agentId": "main", "event": { "type": "step.begin", "uuid": "<uuid-1>", "turnId": "0", "step": 1 }, "time": "<time>" }
@@ -151,6 +204,8 @@ describe('Agent loop', () => {
       [wire] token_counting.measured     { "agentId": "main", "length": 2, "tokens": 8, "time": "<time>" }
       [wire] context.append_loop_event   { "agentId": "main", "event": { "type": "content.part", "uuid": "<uuid-2>", "turnId": "0", "step": 1, "stepUuid": "<uuid-1>", "part": { "type": "text", "text": "blocked" } }, "time": "<time>" }
       [wire] context.append_loop_event   { "agentId": "main", "event": { "type": "step.end", "uuid": "<uuid-1>", "turnId": "0", "step": 1, "finishReason": "filtered", "usage": { "inputOther": 3, "output": 5, "inputCacheRead": 0, "inputCacheCreation": 0 }, "messageId": "mock-1", "providerFinishReason": "filtered", "rawFinishReason": "filtered" }, "time": "<time>" }
+      [wire] agent.message.appended      { "message": { "message": { "role": "assistant", "content": [ { "type": "text", "text": "blocked" } ], "toolCalls": [] }, "meta": { "model": { "provider": "agent-loop", "model": "agent-loop" }, "source": "llm", "usage": { "inputOther": 3, "output": 5, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finish": { "finishReason": "filtered", "rawFinishReason": "filtered" }, "messageId": "mock-1" } }, "time": "<time>", "kind": "event" }
+      [wire] agent.turn.ended            { "turnId": 0, "outcome": "done", "time": "<time>", "kind": "event" }
       [wire] turn.ended                  { "agentId": "main", "turnId": 0, "reason": "failed", "error": { "code": "provider.filtered", "message": "Provider safety policy blocked the response.", "name": "ProviderFilteredError", "details": { "finishReason": "filtered" }, "retryable": false }, "time": "<time>" }
       [emit] turn.ended                  { "time": "<time>", "agentId": "main", "turnId": 0, "reason": "failed", "error": { "code": "provider.filtered", "message": "Provider safety policy blocked the response.", "name": "ProviderFilteredError", "details": { "finishReason": "filtered" }, "retryable": false }, "interruptReason": "filtered" }
     `);
@@ -441,6 +496,8 @@ describe('Agent loop', () => {
       [emit] context.spliced                 { "time": "<time>", "agentId": "main", "start": 0, "deleteCount": 0, "messages": [ { "role": "user", "content": [ { "type": "text", "text": "Look up moon" } ], "toolCalls": [], "origin": { "kind": "user" }, "id": "<msg-1>" } ] }
       [emit] prompt.started                  { "time": "<time>", "agentId": "main", "promptId": "<msg-1>" }
       [wire] context.append_message          { "agentId": "main", "message": { "role": "user", "content": [ { "type": "text", "text": "Look up moon" } ], "toolCalls": [], "origin": { "kind": "user" }, "id": "<msg-1>" }, "time": "<time>" }
+      [wire] agent.message.appended          { "message": { "message": { "role": "user", "content": [ { "type": "text", "text": "Look up moon" } ] }, "meta": { "source": "input" } }, "time": "<time>", "kind": "event" }
+      [wire] agent.turn.started              { "turnId": 0, "queueItemId": "<msg-1>", "time": "<time>", "kind": "event" }
       [wire] plugin.session_start            { "agentId": "main", "content": null, "time": "<time>" }
       [emit] turn.step.started               { "time": "<time>", "agentId": "main", "turnId": 0, "step": 1, "stepId": "<uuid-1>" }
       [wire] context.append_loop_event       { "agentId": "main", "event": { "type": "step.begin", "uuid": "<uuid-1>", "turnId": "0", "step": 1 }, "time": "<time>" }
@@ -485,6 +542,10 @@ describe('Agent loop', () => {
       [emit] turn.step.completed                 { "time": "<time>", "agentId": "main", "turnId": 0, "step": 2, "stepId": "<uuid-4>", "usage": { "inputOther": 25, "output": 12, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finishReason": "end_turn", "providerFinishReason": "completed", "rawFinishReason": "stop" }
       [wire] context.append_loop_event           { "agentId": "main", "event": { "type": "content.part", "uuid": "<uuid-5>", "turnId": "0", "step": 2, "stepUuid": "<uuid-4>", "part": { "type": "text", "text": "The lookup result is lookup-result." } }, "time": "<time>" }
       [wire] context.append_loop_event           { "agentId": "main", "event": { "type": "step.end", "uuid": "<uuid-4>", "turnId": "0", "step": 2, "finishReason": "end_turn", "usage": { "inputOther": 25, "output": 12, "inputCacheRead": 0, "inputCacheCreation": 0 }, "messageId": "mock-2", "providerFinishReason": "completed", "rawFinishReason": "stop" }, "time": "<time>" }
+      [wire] agent.message.appended              { "message": { "message": { "role": "assistant", "content": [ { "type": "text", "text": "I will look it up." } ], "toolCalls": [ { "type": "function", "id": "call_lookup", "name": "Lookup", "arguments": "{\\"query\\":\\"moon\\"}" } ] }, "meta": { "model": { "provider": "agent-loop", "model": "agent-loop" }, "source": "llm", "usage": { "inputOther": 4, "output": 16, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finish": { "finishReason": "tool_calls", "rawFinishReason": "tool_calls" }, "messageId": "mock-1" } }, "time": "<time>", "kind": "event" }
+      [wire] agent.message.appended              { "message": { "message": { "role": "tool", "content": [ { "type": "text", "text": "lookup-result" } ], "toolCallId": "call_lookup" }, "meta": { "source": "tool" } }, "time": "<time>", "kind": "event" }
+      [wire] agent.message.appended              { "message": { "message": { "role": "assistant", "content": [ { "type": "text", "text": "The lookup result is lookup-result." } ], "toolCalls": [] }, "meta": { "model": { "provider": "agent-loop", "model": "agent-loop" }, "source": "llm", "usage": { "inputOther": 25, "output": 12, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finish": { "finishReason": "completed", "rawFinishReason": "stop" }, "messageId": "mock-2" } }, "time": "<time>", "kind": "event" }
+      [wire] agent.turn.ended                    { "turnId": 0, "outcome": "done", "time": "<time>", "kind": "event" }
       [wire] turn.ended                          { "agentId": "main", "turnId": 0, "reason": "completed", "time": "<time>" }
       [emit] turn.ended                          { "time": "<time>", "agentId": "main", "turnId": 0, "reason": "completed" }
     `);
@@ -795,19 +856,23 @@ describe('Agent loop', () => {
       }
     });
     ctx.mockNextResponse({ type: 'text', text: 'one' });
-    ctx.mockNextResponse({ type: 'text', text: 'one-continued' });
     ctx.mockNextResponse({ type: 'text', text: 'two' });
     ctx.mockNextResponse({ type: 'text', text: 'three' });
+    ctx.mockNextResponse({ type: 'text', text: 'four' });
 
     const first = submitTurn(loop, 'first').turn;
     const second = submitTurn(loop, 'second').turn;
     const third = submitTurn(loop, 'third').turn;
     loop.notify();
+    const launchedStates = [first.state, second.state, third.state];
 
-    expect([first.state, second.state, third.state]).toEqual(['running', 'queued', 'queued']);
     await Promise.all([first.result, second.result, third.result]);
     subscription.dispose();
 
+    expect(launchedStates).toEqual(['running', 'queued', 'queued']);
+    await expect(first.result).resolves.toMatchObject({ type: 'completed' });
+    await expect(second.result).resolves.toMatchObject({ type: 'completed' });
+    await expect(third.result).resolves.toMatchObject({ type: 'completed' });
     expect(events).toEqual([
       'turn.started:0',
       'turn.ended:0',
@@ -865,6 +930,43 @@ describe('Agent loop', () => {
     lease?.dispose();
     await expect(held.result).resolves.toMatchObject({ type: 'completed' });
     subscription.dispose();
+
+    const parked = createTestAgent(sessionService(IAgentLifecycleService, parkedLifecycleStub()));
+    try {
+      const parkedLoop = parked.get(IAgentLoopService);
+      const early = submitTurn(parkedLoop, 'early').turn;
+      expect(parkedLoop.status()).toMatchObject({ state: 'idle', hasPendingRequests: true });
+      expect(parked.llmCalls).toHaveLength(0);
+
+      const earlyQueueId = parkedLoop.status().pendingPromptIds[0]!;
+      expect(parkedLoop.cancelQueued(earlyQueueId, new Error('not wanted'))).toBe(true);
+      await expect(early.result).resolves.toMatchObject({ type: 'cancelled' });
+
+      const real = submitTurn(parkedLoop, 'real').turn;
+      let nudgeConsumed = 0;
+      parkedLoop.notify({
+        message: { role: 'user', content: [{ type: 'text', text: 'nudge text' }], toolCalls: [] },
+        onConsume: () => {
+          nudgeConsumed += 1;
+        },
+      });
+      parked.mockNextResponse({ type: 'text', text: 'real answer' });
+      const parkedRef = attachParkedEngine(parkedLoop);
+      try {
+        await expect(real.result).resolves.toMatchObject({ type: 'completed' });
+        expect(nudgeConsumed).toBe(1);
+        expect(parked.llmCalls).toHaveLength(1);
+        expect(parked.contextData().history).toContainEqual(
+          expect.objectContaining({
+            content: [{ type: 'text', text: 'nudge text' }],
+          }),
+        );
+      } finally {
+        parkedRef.stop();
+      }
+    } finally {
+      await parked.dispose();
+    }
   });
 
   it('can abort an admission while quiescence holds it', async () => {
@@ -1416,9 +1518,10 @@ describe('interruption reminder', () => {
   let ctx: TestAgentContext;
   let loop: IAgentLoopService;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     ctx = createTestAgent();
     loop = ctx.get(IAgentLoopService);
+    await ctx.restorePersisted();
   });
 
   afterEach(async () => {
@@ -1644,12 +1747,22 @@ describe('interruption reminder', () => {
 
     await ctx.undoHistory(1);
 
-    expect(ctx.contextData().history).toEqual([]);
+    expect(
+      ctx.contextData().history.map((message) => ({
+        role: message.role,
+        origin: message.origin,
+      })),
+    ).toEqual([
+      {
+        role: 'user',
+        origin: { kind: 'injection', variant: 'interruption', ownerPromptId: undefined },
+      },
+    ]);
 
     ctx.mockNextResponse({ type: 'text', text: 'second answer' });
     await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Next' }] });
     await ctx.untilTurnEnd();
-    expect(interruptionReminders()).toHaveLength(0);
+    expect(interruptionReminders()).toHaveLength(1);
   });
 
   it('drops unsigned thinking but keeps signed thinking on user cancel', async () => {
@@ -1956,6 +2069,44 @@ function submitTurn(loop: IAgentLoopService, text: string): { readonly turn: Tur
       origin: { kind: 'user' },
     },
   });
+}
+
+function parkedLifecycleStub(): IAgentLifecycleService {
+  return {
+    _serviceBrand: undefined,
+    onDidCreate: Event.None as Event<AgentContext>,
+    onDidCreateScope: Event.None as Event<AgentScopeCreatedEvent>,
+    onWillClose: Event.None as Event<AgentContext>,
+    onDidClose: Event.None as Event<AgentContext>,
+    create: () => Promise.reject(new Error('parked lifecycle stub')),
+    fork: () => Promise.reject(new Error('parked lifecycle stub')),
+    get: () => undefined,
+    list: () => [],
+    broadcastPermissionMode: () => {},
+    remove: () => Promise.resolve(),
+    handleOf: () => undefined,
+    adopt: (handle) => agentContextOf(handle),
+  };
+}
+
+function attachParkedEngine(loop: IAgentLoopService) {
+  const bundle = loop.buildAttachBundle();
+  const ref = createActor(createAgentMachine({}), {
+    input: {
+      request: bundle.request,
+      scopeFactory: () =>
+        Promise.resolve({
+          store: bundle.store,
+          turnLogic: bundle.turnLogic,
+          toolLogic: bundle.toolLogic,
+          tools: bundle.tools,
+          request: bundle.request,
+        }),
+    },
+  });
+  ref.start();
+  loop.attachEngine(ref, bundle);
+  return ref;
 }
 
 function createTimingRequester(): IAgentLLMRequesterService {
