@@ -61,7 +61,7 @@ const hookDefSchema = z.object({
   ]),
   matcher: z.string().optional(),
   command: z.string().min(1),
-  timeout: z.number().int().min(1).max(600).optional(),
+  timeout: z.number().int().min(1).max(86400).optional(),
 });
 
 const pluginCommandEntrySchema = z.object({

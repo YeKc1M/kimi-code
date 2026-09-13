@@ -40,12 +40,16 @@ const OptionalStringSchema = z.preprocess(
   },
   z.string().optional(),
 );
+const PermissionDecisionSchema = z.preprocess(
+  (value) => (value === 'allow' || value === 'deny' ? value : undefined),
+  z.enum(['allow', 'deny']).optional(),
+);
 const HookSpecificOutputSchema = z.preprocess(
   (value) => (isRecord(value) ? value : undefined),
   z
     .looseObject({
       message: OptionalStringSchema,
-      permissionDecision: z.unknown().optional(),
+      permissionDecision: PermissionDecisionSchema,
       permissionDecisionReason: z.unknown().optional(),
     })
     .optional(),
@@ -160,6 +164,7 @@ function resultFromExitCode(exitCode: number, stdout: string, stderr: string): H
       stderr,
       exitCode,
       structuredOutput: structured.structuredOutput,
+      permissionDecision: structured.permissionDecision,
     };
   }
 
@@ -169,12 +174,19 @@ function resultFromExitCode(exitCode: number, stdout: string, stderr: string): H
     stderr,
     exitCode,
     structuredOutput: structured?.structuredOutput,
+    permissionDecision: structured?.permissionDecision,
   });
 }
 
-function structuredOutput(
-  stdout: string,
-): { action?: 'block'; reason?: string; message?: string; structuredOutput: true } | undefined {
+interface StructuredHookOutput {
+  readonly action?: 'block';
+  readonly reason?: string;
+  readonly message?: string;
+  readonly permissionDecision?: 'allow' | 'deny';
+  readonly structuredOutput: true;
+}
+
+function structuredOutput(stdout: string): StructuredHookOutput | undefined {
   const text = stdout.trim();
   if (text.length === 0) return undefined;
 
@@ -184,21 +196,24 @@ function structuredOutput(
     if (!output.success) return undefined;
 
     const { message, hookSpecificOutput } = output.data;
+    const permissionDecision = hookSpecificOutput?.permissionDecision;
     const result = {
       message: message ?? hookSpecificOutput?.message,
       structuredOutput: true as const,
+      permissionDecision,
     };
-    if (hookSpecificOutput?.permissionDecision !== 'deny') {
+    if (permissionDecision !== 'deny') {
       return result;
     }
     return {
       action: 'block',
       message: result.message,
       reason:
-        typeof hookSpecificOutput.permissionDecisionReason === 'string'
+        typeof hookSpecificOutput?.permissionDecisionReason === 'string'
           ? hookSpecificOutput.permissionDecisionReason
           : undefined,
       structuredOutput: true as const,
+      permissionDecision,
     };
   } catch {
     return undefined;
@@ -207,6 +222,7 @@ function structuredOutput(
 
 function allowResult(input: {
   readonly message?: string;
+  readonly permissionDecision?: 'allow' | 'deny';
   readonly stdout?: string;
   readonly stderr?: string;
   readonly exitCode?: number;
@@ -216,6 +232,7 @@ function allowResult(input: {
   return {
     action: 'allow',
     message: input.message,
+    permissionDecision: input.permissionDecision,
     stdout: input.stdout,
     stderr: input.stderr,
     exitCode: input.exitCode,

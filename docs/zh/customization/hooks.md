@@ -46,7 +46,7 @@ command = "terminal-notifier -title Kimi -message 'Task done'"
 | `event` | `string` | 是 | 触发事件名，取值见 [事件一览](#事件一览) |
 | `matcher` | `string` | 否 | 用正则表达式（一种字符串匹配语法）过滤事件目标；不填则匹配全部 |
 | `command` | `string` | 是 | 触发时要运行的 Shell 命令 |
-| `timeout` | `integer` | 否 | 超时秒数，范围 1–600；默认 30 秒 |
+| `timeout` | `integer` | 否 | 超时秒数，范围 1–86400；默认 30 秒 |
 
 `[[hooks]]` 只允许这四个字段，多写会导致配置文件加载失败。
 
@@ -100,7 +100,7 @@ Hook 命令的工作目录是当前会话的项目目录。
 ```
 
 ::: info 说明
-只有**可阻断事件**（`PreToolUse`、`Stop`、`UserPromptSubmit`）的返回值会影响主流程。其余事件属于**观察型事件**：触发后即发即忘，不管脚本返回什么，主流程都不会改变。
+只有**可阻断事件**（`PreToolUse`、`Stop`、`UserPromptSubmit`）的返回值会影响主流程。其余事件属于**观察型事件**：触发后即发即忘，不管脚本返回什么，主流程都不会改变。有一个例外：开启实验性 flag `hook_permission_decisions` 后，`PermissionRequest` hook 可以批准或拒绝待审批请求（见下文「用 hook 决定审批」）。
 :::
 
 ## 事件一览
@@ -114,7 +114,7 @@ Hook 命令的工作目录是当前会话的项目目录。
 | `TurnStarted` | 回合来源类型（如 `user`、`task`、`system_trigger`） | — | 新回合开始时触发；payload 含 `turn_id`、`origin_kind`、`origin_name`、`prompt` |
 | `PostToolUse` | 工具名 | — | 工具成功执行后触发 |
 | `PostToolUseFailure` | 工具名 | — | 工具失败或被阻断后触发 |
-| `PermissionRequest` | 工具名 | — | 即将等待用户审批前触发 |
+| `PermissionRequest` | 工具名 | ✓（实验性） | 即将等待用户审批前触发；默认仅观察，开启 `hook_permission_decisions` flag 后可返回审批决策（见下文「用 hook 决定审批」） |
 | `PermissionResult` | 工具名 | — | 审批结束后触发 |
 | `SessionStart` | `startup` 或 `resume` | — | 新会话启动或历史会话恢复后触发；payload 含 `source`、`model`、`profile` |
 | `SessionEnd` | `exit` 或 `archive` | — | 会话关闭后触发；`archive` 表示会话被归档而非退出 |
@@ -127,6 +127,48 @@ Hook 命令的工作目录是当前会话的项目目录。
 | `PreCompact` | `manual` 或 `auto` | — | 上下文压缩开始前触发；返回值被完全忽略 |
 | `PostCompact` | `manual` 或 `auto` | — | 上下文压缩完成后触发 |
 | `Notification` | 通知类型（如 `task.completed`） | — | 后台任务状态变化时触发 |
+
+## 用 hook 决定审批（实验性）
+
+默认情况下，`PermissionRequest` 是观察型事件：它在 CLI 即将等待你审批前触发，脚本的返回值会被忽略。开启实验性 flag `hook_permission_decisions` 后，它变成一个决策点——CLI 会先运行匹配的 hook 并等待结果，hook 可以直接答复这次审批请求。
+
+通过 `config.toml` 的 `[experimental]` 段或环境变量开启：
+
+```toml
+[experimental]
+hook_permission_decisions = true
+```
+
+```sh
+export KIMI_CODE_EXPERIMENTAL_HOOK_PERMISSION_DECISIONS=1
+```
+
+除[基础事件字段](#事件数据格式)外，hook 还会通过 stdin 收到这次待审批的详细信息：
+
+| 字段 | 说明 |
+| --- | --- |
+| `tool_name` | 等待审批的工具名；也是 `matcher` 匹配的值 |
+| `tool_input` | 工具调用的参数 |
+| `action` | 对待批准内容的可读摘要 |
+| `display` | 审批界面使用的结构化展示数据（plan 评审时，plan 文本在 `display.plan` 中） |
+| `id` / `session_id` / `agent_id` / `turn_id` / `tool_call_id` | 请求及其上下文的标识符 |
+
+脚本通过 stdout 的 JSON 契约作答——`permissionDecision: "allow"` 批准该工具调用，`"deny"` 拒绝，且 `permissionDecisionReason` 会作为反馈交给模型：
+
+```json
+{
+  "hookSpecificOutput": {
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "请在计划中补充回滚步骤"
+  }
+}
+```
+
+其他结果——没有 JSON 输出、无法识别的值、非零退出码、超时或崩溃——都会回退到正常的审批提示（fail-open）。多条 hook 同时匹配时，只要有一个 `deny` 就优先于所有 `allow`。决策类 hook 常常要等待交互式评审，因此 `timeout` 字段的上限为 86400 秒（24 小时）；默认仍是 30 秒。
+
+::: warning 注意
+开启该 flag 后，匹配的 hook 会**代替你**批准或拒绝工具调用，不再弹出审批提示。请只在你完全信任的 hook 命令下开启。
+:::
 
 ## 示例：阻断危险 Shell 命令
 

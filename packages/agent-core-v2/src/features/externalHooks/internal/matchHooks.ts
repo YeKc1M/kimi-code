@@ -103,6 +103,28 @@ export function blockDecision(
   };
 }
 
+export type HookPermissionDecision =
+  | { readonly decision: 'allow' }
+  | { readonly decision: 'deny'; readonly reason: string };
+
+export function permissionDecisionFromResults(
+  results: readonly HookResult[],
+): HookPermissionDecision | undefined {
+  const deny = results.find((result) => result.permissionDecision === 'deny');
+  if (deny !== undefined) {
+    const reason = deny.reason?.trim();
+    return {
+      decision: 'deny',
+      reason:
+        reason === undefined || reason.length === 0 ? 'Denied by PermissionRequest hook' : reason,
+    };
+  }
+  if (results.some((result) => result.permissionDecision === 'allow')) {
+    return { decision: 'allow' };
+  }
+  return undefined;
+}
+
 function matches(pattern: string, value: string): boolean {
   if (pattern.length === 0) return true;
   try {

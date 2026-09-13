@@ -5,6 +5,8 @@ import { Service } from '#/_base/di/service';
 import { LifecycleScope } from '#/app/scopes';
 import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import { abortable, isUserCancellation } from '#/_base/utils/abort';
+import { HOOK_PERMISSION_DECISIONS_FLAG_ID } from '#/features/externalHooks/internal/flag';
+import type { HookResult } from '#/features/externalHooks/internal/types';
 import { IAgentPermissionModeService } from '#/agent/permissionMode/permissionMode';
 import type {
   ApprovalResponse,
@@ -19,6 +21,9 @@ import type {
   ResolvedToolExecutionHookContext,
 } from '#/agent/toolExecutor/toolHooks';
 import { AgentEvent2 } from '#/app/event/event2';
+import { IExternalHooksRunnerService } from '#/features/externalHooks/app/externalHooksRunner';
+import { permissionDecisionFromResults } from '#/features/externalHooks/internal/matchHooks';
+import { IFlagService } from '#/app/flag/flag';
 import { ITelemetryService } from '#/app/telemetry/telemetry';
 import {
   INTERACTION_TAG_AGENT_ID,
@@ -76,6 +81,8 @@ export class AgentToolApprovalService extends Service implements IAgentToolAppro
     @ISessionContext private readonly session: ISessionContext,
     @ITelemetryService private readonly telemetry: ITelemetryService,
     @IEventDispatcher private readonly dispatcher: IEventDispatcher,
+    @IExternalHooksRunnerService private readonly hooksRunner: IExternalHooksRunnerService,
+    @IFlagService private readonly flags: IFlagService,
   ) {
     super();
   }
@@ -135,52 +142,58 @@ export class AgentToolApprovalService extends Service implements IAgentToolAppro
     } satisfies PermissionApprovalRequestedPayload;
     const startedAt = Date.now();
 
-    const tags: InteractionTags = {
-      [INTERACTION_TAG_AGENT_ID]: this.scopeContext.agentId,
-      [INTERACTION_TAG_SESSION_ID]: this.session.sessionId,
-      [INTERACTION_TAG_TURN_ID]: context.turnId,
-      [INTERACTION_TAG_TOOL_CALL_ID]: context.toolCall.id,
-    };
     let response: ApprovalResponse;
-    void this.dispatcher.dispatch(new PermissionApprovalRequested(approvalContext));
-    try {
-      response = await abortable(
-        interactions.request<typeof approvalRequest, ApprovalResponse>({
-          id: approvalRequest.id,
-          kind: 'approval',
-          payload: approvalRequest,
-          tags,
-        }),
-        context.signal,
-      );
-      context.signal.throwIfAborted();
-    } catch (error) {
-      if (isUserCancellation(error)) throw error;
-      this.telemetry.track2('permission_approval_result', {
-        turn_id: context.turnId,
-        tool_call_id: context.toolCall.id,
-        policy_name: origin,
-        tool_name: name,
-        permission_mode: this.modeService.mode,
-        result: 'error',
-        approval_surface: display.kind,
-        duration_ms: Date.now() - startedAt,
-        session_cache_written: false,
-        has_feedback: false,
-        trace_id: context.trace?.traceId,
-      });
-      void this.dispatcher.dispatch(
-        new PermissionApprovalResolved({
-          ...approvalContext,
-          decision: 'error',
-          error: error instanceof Error ? error.message : String(error),
-        }),
-      );
-      const resolved = result.resolveError?.(error);
-      if (resolved !== undefined) {
-        return this.resolvePermissionResolution(resolved, context, origin);
+    const hookDecision = await this.requestHookPermissionDecision(approvalContext, context);
+    if (hookDecision !== undefined) {
+      void this.dispatcher.dispatch(new PermissionApprovalRequested(approvalContext));
+      response = hookDecision;
+    } else {
+      const tags: InteractionTags = {
+        [INTERACTION_TAG_AGENT_ID]: this.scopeContext.agentId,
+        [INTERACTION_TAG_SESSION_ID]: this.session.sessionId,
+        [INTERACTION_TAG_TURN_ID]: context.turnId,
+        [INTERACTION_TAG_TOOL_CALL_ID]: context.toolCall.id,
+      };
+      void this.dispatcher.dispatch(new PermissionApprovalRequested(approvalContext));
+      try {
+        response = await abortable(
+          interactions.request<typeof approvalRequest, ApprovalResponse>({
+            id: approvalRequest.id,
+            kind: 'approval',
+            payload: approvalRequest,
+            tags,
+          }),
+          context.signal,
+        );
+        context.signal.throwIfAborted();
+      } catch (error) {
+        if (isUserCancellation(error)) throw error;
+        this.telemetry.track2('permission_approval_result', {
+          turn_id: context.turnId,
+          tool_call_id: context.toolCall.id,
+          policy_name: origin,
+          tool_name: name,
+          permission_mode: this.modeService.mode,
+          result: 'error',
+          approval_surface: display.kind,
+          duration_ms: Date.now() - startedAt,
+          session_cache_written: false,
+          has_feedback: false,
+          trace_id: context.trace?.traceId,
+        });
+        void this.dispatcher.dispatch(
+          new PermissionApprovalResolved({
+            ...approvalContext,
+            decision: 'error',
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+        const resolved = result.resolveError?.(error);
+        if (resolved !== undefined) {
+          return this.resolvePermissionResolution(resolved, context, origin);
+        }
+        throw error;
       }
-      throw error;
     }
 
     const sessionApprovalRule =
@@ -252,6 +265,31 @@ export class AgentToolApprovalService extends Service implements IAgentToolAppro
       return `${message} Try a different approach — don't retry the same call, don't attempt to bypass the restriction.`;
     }
     return message;
+  }
+
+  private async requestHookPermissionDecision(
+    approvalContext: PermissionApprovalRequestedPayload,
+    context: ResolvedToolExecutionHookContext,
+  ): Promise<ApprovalResponse | undefined> {
+    if (!this.flags.enabled(HOOK_PERMISSION_DECISIONS_FLAG_ID)) return undefined;
+    if (!this.hooksRunner.hasHooksFor('PermissionRequest')) return undefined;
+    let results: HookResult[];
+    try {
+      results = await this.hooksRunner.trigger('PermissionRequest', {
+        matcherValue: context.toolCall.name,
+        inputData: { ...approvalContext },
+        sessionId: this.session.sessionId,
+        signal: context.signal,
+      });
+    } catch {
+      return undefined;
+    }
+    context.signal.throwIfAborted();
+    const decision = permissionDecisionFromResults(results);
+    if (decision === undefined) return undefined;
+    return decision.decision === 'allow'
+      ? { decision: 'approved' }
+      : { decision: 'rejected', feedback: decision.reason };
   }
 
   private usesWorkerRejectionGuidance(): boolean {
