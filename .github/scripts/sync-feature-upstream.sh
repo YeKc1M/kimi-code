@@ -21,14 +21,31 @@ ensure_pr() {
     fi
   else
     echo "Creating PR ${SYNC_BRANCH} -> ${FEATURE_BRANCH}"
-    if ! output="$(gh pr create \
+    if output="$(gh pr create \
       --base "$FEATURE_BRANCH" \
       --head "$SYNC_BRANCH" \
       --title "chore: merge upstream ${UPSTREAM_BRANCH} into ${FEATURE_BRANCH} ($(date -u +%Y-%m-%d))" \
       --body-file "$body_file" 2>&1)"; then
-      pr_api_fail "$output"
+      echo "$output"
+      return 0
     fi
     echo "$output"
+    if grep -q "Resource not accessible by integration" <<< "$output"; then
+      echo "GraphQL createPullRequest blocked; retrying via REST API"
+      local rest_output
+      if rest_output="$(gh api -X POST "repos/{owner}/{repo}/pulls" \
+        -f base="$FEATURE_BRANCH" \
+        -f head="$SYNC_BRANCH" \
+        -f title="chore: merge upstream ${UPSTREAM_BRANCH} into ${FEATURE_BRANCH} ($(date -u +%Y-%m-%d))" \
+        -F body=@"$body_file" \
+        --jq '.html_url' 2>&1)"; then
+        echo "$rest_output"
+        return 0
+      fi
+      echo "$rest_output"
+      pr_api_fail "$rest_output"
+    fi
+    fail "gh PR operation failed (see output above)"
   fi
 }
 
