@@ -5,57 +5,13 @@ set -euo pipefail
 : "${SYNC_BRANCH:?must be set (configure it as a repo Actions Variable)}"
 : "${UPSTREAM_REPO:?must be set, e.g. MoonshotAI/kimi-code}"
 : "${UPSTREAM_BRANCH:?must be set, e.g. main}"
+: "${REPO:?must be set (use github.repository in the workflow)}"
+OWNER="${REPO%%/*}"
 UPSTREAM_URL="https://github.com/${UPSTREAM_REPO}.git"
 
 fail() {
   echo "::error::$*"
   exit 1
-}
-
-ensure_pr() {
-  local body_file="$1" output
-  if [ -n "$open_pr_number" ]; then
-    echo "Updating existing PR #${open_pr_number}"
-    if ! output="$(gh pr comment "$open_pr_number" --body-file "$body_file" 2>&1)"; then
-      pr_api_fail "$output"
-    fi
-  else
-    echo "Creating PR ${SYNC_BRANCH} -> ${FEATURE_BRANCH}"
-    if output="$(gh pr create \
-      --base "$FEATURE_BRANCH" \
-      --head "$SYNC_BRANCH" \
-      --title "chore: merge upstream ${UPSTREAM_BRANCH} into ${FEATURE_BRANCH} ($(date -u +%Y-%m-%d))" \
-      --body-file "$body_file" 2>&1)"; then
-      echo "$output"
-      return 0
-    fi
-    echo "$output"
-    if grep -q "Resource not accessible by integration" <<< "$output"; then
-      echo "GraphQL createPullRequest blocked; retrying via REST API"
-      local rest_output
-      if rest_output="$(gh api -X POST "repos/{owner}/{repo}/pulls" \
-        -f base="$FEATURE_BRANCH" \
-        -f head="$SYNC_BRANCH" \
-        -f title="chore: merge upstream ${UPSTREAM_BRANCH} into ${FEATURE_BRANCH} ($(date -u +%Y-%m-%d))" \
-        -F body=@"$body_file" \
-        --jq '.html_url' 2>&1)"; then
-        echo "$rest_output"
-        return 0
-      fi
-      echo "$rest_output"
-      pr_api_fail "$rest_output"
-    fi
-    fail "gh PR operation failed (see output above)"
-  fi
-}
-
-pr_api_fail() {
-  local output="$1"
-  echo "$output"
-  if grep -q "Resource not accessible by integration" <<< "$output"; then
-    fail "GITHUB_TOKEN cannot create/comment PRs. Fix: repo Settings -> Actions -> General -> Workflow permissions -> enable 'Allow GitHub Actions to create and approve pull requests'."
-  fi
-  fail "gh PR operation failed (see output above)"
 }
 
 echo "::group::Setup"
@@ -76,10 +32,12 @@ UPSTREAM_SHA="$(git rev-parse --short "$UPSTREAM_REF")"
 git fetch origin "$FEATURE_BRANCH"
 
 # Reuse the sync branch only while its PR is still open; otherwise start fresh
-# from the feature branch.
+# from the feature branch. Use the REST API for all PR operations: the
+# GraphQL createPullRequest mutation is rejected for GITHUB_TOKEN on forks
+# ("Resource not accessible by integration") while REST works.
 open_pr_number=""
 if git show-ref --verify --quiet "refs/remotes/origin/${SYNC_BRANCH}"; then
-  open_pr_number="$(gh pr list --state open --head "$SYNC_BRANCH" --base "$FEATURE_BRANCH" --json number --jq '.[0].number // empty')"
+  open_pr_number="$(gh api "repos/${REPO}/pulls?head=${OWNER}:${SYNC_BRANCH}&base=${FEATURE_BRANCH}&state=open" --jq '.[0].number // empty')"
 fi
 
 if [ -n "$open_pr_number" ]; then
@@ -119,7 +77,7 @@ This repository is in the middle of a git merge with unresolved conflicts.
 
 Context: this is a fork of ${UPSTREAM_REPO}. The current branch ${SYNC_BRANCH} is a sync branch
 based on the fork feature branch ${FEATURE_BRANCH}, and it is merging upstream ${UPSTREAM_BRANCH}.
-The feature branch adds a hook permission-decisions feature; upstream keeps evolving.
+The feature branch carries the fork's own feature work; upstream keeps evolving.
 
 Task:
 1. Run \`git status\` and \`git diff --name-only --diff-filter=U\` to list the conflicted files.
@@ -188,6 +146,20 @@ PR_BODY_FILE="$(mktemp)"
   echo '```'
 } > "$PR_BODY_FILE"
 
-ensure_pr "$PR_BODY_FILE"
+if [ -n "$open_pr_number" ]; then
+  echo "Updating existing PR #${open_pr_number}"
+  gh api -X POST "repos/${REPO}/issues/${open_pr_number}/comments" -F body=@"$PR_BODY_FILE" > /dev/null \
+    || fail "Failed to comment on PR #${open_pr_number}. Check the token (GH_TOKEN) has pull-requests write access to ${REPO}."
+else
+  echo "::group::Create PR"
+  gh api -X POST "repos/${REPO}/pulls" \
+    -f title="chore: merge upstream ${UPSTREAM_BRANCH} into ${FEATURE_BRANCH} ($(date -u +%Y-%m-%d))" \
+    -f head="$SYNC_BRANCH" \
+    -f base="$FEATURE_BRANCH" \
+    -F body=@"$PR_BODY_FILE" \
+    --jq '.html_url' \
+    || fail "Failed to create PR. Check the token (GH_TOKEN) has pull-requests write access to ${REPO}, and that 'Allow GitHub Actions to create and approve pull requests' is enabled in Settings > Actions."
+  echo "::endgroup::"
+fi
 
 echo "Done."

@@ -52,4 +52,5 @@ jobs:
           SYNC_BRANCH: ${{ vars.SYNC_BRANCH }}
           UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO }}
           UPSTREAM_BRANCH: ${{ vars.UPSTREAM_BRANCH }}
+          REPO: ${{ github.repository }}
         run: bash .github/scripts/sync-feature-upstream.sh
