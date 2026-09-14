@@ -16,11 +16,8 @@ import type { CompactionResult } from '#/agent/fullCompaction/types';
 import { IAgentLoopService, type AfterStepContext } from '#/agent/loop/loop';
 import { TurnStarted } from '#/agent/loop/turnEvents';
 import { TurnEnded } from '#/agent/loop/turnOps';
-import {
-  IAgentPromptService,
-  type PromptSubmitContext,
-} from '#/agent/prompt/prompt';
-import { PromptQueued } from '#/agent/prompt/promptService';
+import { type PromptSubmitContext } from '#/agent/loop/loop';
+import { PromptQueued } from '#/agent/prompt/promptEvents';
 import { TaskNotified, TaskStarted } from '#/agent/task/taskOps';
 import {
   PermissionApprovalRequested,
@@ -145,7 +142,7 @@ export class AgentExternalHooksService extends Service implements IAgentExternal
     );
 
     this.registerPromptHooks(
-      this.instantiation.invokeFunction((accessor) => accessor.get(IAgentPromptService)),
+      this.instantiation.invokeFunction((accessor) => accessor.get(IAgentLoopService)),
     );
 
     this.registerTurnHooks();
@@ -196,9 +193,9 @@ export class AgentExternalHooksService extends Service implements IAgentExternal
     );
   }
 
-  private registerPromptHooks(prompt: IAgentPromptService): void {
+  private registerPromptHooks(loop: IAgentLoopService): void {
     this._register(
-      prompt.hooks.onBeforeSubmitPrompt.register('externalHooks', async (ctx, next) => {
+      loop.hooks.onBeforeSubmitPrompt.register('externalHooks', async (ctx, next) => {
         if (await this.runPromptSubmitHook(ctx)) {
           ctx.block = true;
           return;
@@ -246,7 +243,7 @@ export class AgentExternalHooksService extends Service implements IAgentExternal
         if (
           ctx.finishReason === 'tool_calls' ||
           ctx.finishReason === 'filtered' ||
-          loop.hasPendingRequests()
+          loop.snapshot().hasPendingRequests
         ) {
           return;
         }
