@@ -665,6 +665,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
         agentId: this.scopeContext.agentId,
         promptId: input.promptId,
         content: stripBundledSkillBlocks(input.message),
+        clientMetadata: input.origin.clientMetadata,
         queueLength: (this.engine?.snapshot().queue.length ?? 0) + 1,
       }),
     );
@@ -688,6 +689,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
         userMessageId: input.userMessageId,
         status,
         content: stripBundledSkillBlocks(input.message),
+        clientMetadata: input.origin.clientMetadata,
         createdAt: input.createdAt,
       }),
     );
@@ -1331,13 +1333,6 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
           sentToMachine: true,
         });
         void this.dispatcher.dispatch(
-          new TurnSteer({
-            agentId: this.scopeContext.agentId,
-            input: gatedContent,
-            origin: merged.origin,
-          }),
-        );
-        void this.dispatcher.dispatch(
           new PromptSteered({
             agentId: this.scopeContext.agentId,
             activePromptId: active.prompt.id,
@@ -1346,6 +1341,13 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
               stripBundledSkillBlocks(child.projection.message),
             ),
             steeredAt: new Date().toISOString(),
+          }),
+        );
+        void this.dispatcher.dispatch(
+          new TurnSteer({
+            agentId: this.scopeContext.agentId,
+            input: gatedContent,
+            origin: merged.origin,
           }),
         );
         return;
