@@ -60,6 +60,7 @@ import { IPluginService } from '#/app/plugin/plugin';
 import { ISessionManager } from '#/app/sessionManager/sessionManager';
 import { IHostProcessService } from '#/os/interface/hostProcess';
 import { HostProcessService } from '#/os/backends/node-local/hostProcessService';
+import { ITelemetryService } from '#/app/telemetry/telemetry';
 import {
   type SessionCloseReason,
   type SessionCreatedEvent,
@@ -680,6 +681,7 @@ describe('IExternalHooksRunnerService integration', () => {
         },
       });
       activateAgentEventBus(ix);
+      ix.stub(ITelemetryService, { track2: () => {} });
       ix.set(IExternalHooksRunnerService, new SyncDescriptor(ExternalHooksRunnerService));
       ix.set(IAgentExternalHooksService, new SyncDescriptor(AgentExternalHooksService));
       ix.get(IAgentExternalHooksService);
@@ -944,6 +946,7 @@ describe('IExternalHooksRunnerService integration', () => {
           reg.define(IHostProcessService, HostProcessService);
         },
       });
+      ix.stub(ITelemetryService, { track2: () => {} });
       ix.set(IExternalHooksRunnerService, new SyncDescriptor(ExternalHooksRunnerService));
       ix.set(ISessionExternalHooksService, new SyncDescriptor(SessionExternalHooksService));
       ix.get(ISessionExternalHooksService);
@@ -1138,6 +1141,7 @@ describe('IExternalHooksRunnerService integration', () => {
           reg.define(IHostProcessService, HostProcessService);
         },
       });
+      ix.stub(ITelemetryService, { track2: () => {} });
       ix.set(IExternalHooksRunnerService, new SyncDescriptor(ExternalHooksRunnerService));
       ix.set(ISessionExternalHooksService, new SyncDescriptor(SessionExternalHooksService));
       ix.get(ISessionExternalHooksService);
