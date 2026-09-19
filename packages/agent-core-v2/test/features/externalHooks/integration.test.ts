@@ -49,15 +49,18 @@ import { IAgentToolExecutorService } from '#/agent/toolExecutor/toolExecutor';
 import { IExternalHooksRunnerService } from '#/features/externalHooks/app/externalHooksRunner';
 import { ExternalHooksRunnerService } from '#/features/externalHooks/app/externalHooksRunnerService';
 import { makeHookRunner } from './runner-stub';
+import { stubFlag } from '../../app/flag/stubs';
 import type { AgentTaskInfo } from '#/agent/task/task';
 import { IBootstrapService } from '#/app/bootstrap/bootstrap';
 import { IConfigService } from '#/app/config/config';
 import { IEventBus, ISessionEventBus } from '#/app/event/eventBus';
 import { AgentEventBusView, EventBusService } from '#/app/event/eventBusService';
+import { IFlagService } from '#/app/flag/flag';
 import { IPluginService } from '#/app/plugin/plugin';
 import { ISessionManager } from '#/app/sessionManager/sessionManager';
 import { IHostProcessService } from '#/os/interface/hostProcess';
 import { HostProcessService } from '#/os/backends/node-local/hostProcessService';
+import { ITelemetryService } from '#/app/telemetry/telemetry';
 import {
   type SessionCloseReason,
   type SessionCreatedEvent,
@@ -357,6 +360,7 @@ describe('IExternalHooksRunnerService integration', () => {
             hooks: createHooks(['onWillCompact']),
           });
           reg.definePartialInstance(IAgentTaskService, {});
+          reg.defineInstance(IFlagService, stubFlag(false));
         },
       });
       activateAgentEventBus(ix);
@@ -462,6 +466,7 @@ describe('IExternalHooksRunnerService integration', () => {
             hooks: createHooks(['onWillCompact']),
           });
           reg.definePartialInstance(IAgentTaskService, {});
+          reg.defineInstance(IFlagService, stubFlag(false));
         },
       });
       activateAgentEventBus(ix);
@@ -666,6 +671,7 @@ describe('IExternalHooksRunnerService integration', () => {
             hooks: createHooks(['onWillCompact']),
           });
           reg.definePartialInstance(IAgentTaskService, {});
+          reg.defineInstance(IFlagService, stubFlag(false));
           reg.define(IHostProcessService, HostProcessService);
           reg.defineInstance(IEventDispatcher, {
             _serviceBrand: undefined,
@@ -675,6 +681,7 @@ describe('IExternalHooksRunnerService integration', () => {
         },
       });
       activateAgentEventBus(ix);
+      ix.stub(ITelemetryService, { track2: () => {} });
       ix.set(IExternalHooksRunnerService, new SyncDescriptor(ExternalHooksRunnerService));
       ix.set(IAgentExternalHooksService, new SyncDescriptor(AgentExternalHooksService));
       ix.get(IAgentExternalHooksService);
@@ -939,6 +946,7 @@ describe('IExternalHooksRunnerService integration', () => {
           reg.define(IHostProcessService, HostProcessService);
         },
       });
+      ix.stub(ITelemetryService, { track2: () => {} });
       ix.set(IExternalHooksRunnerService, new SyncDescriptor(ExternalHooksRunnerService));
       ix.set(ISessionExternalHooksService, new SyncDescriptor(SessionExternalHooksService));
       ix.get(ISessionExternalHooksService);
@@ -1133,6 +1141,7 @@ describe('IExternalHooksRunnerService integration', () => {
           reg.define(IHostProcessService, HostProcessService);
         },
       });
+      ix.stub(ITelemetryService, { track2: () => {} });
       ix.set(IExternalHooksRunnerService, new SyncDescriptor(ExternalHooksRunnerService));
       ix.set(ISessionExternalHooksService, new SyncDescriptor(SessionExternalHooksService));
       ix.get(ISessionExternalHooksService);
@@ -1199,6 +1208,7 @@ describe('IExternalHooksRunnerService integration', () => {
             hooks: createHooks(['onWillCompact']),
           });
           reg.definePartialInstance(IAgentTaskService, {});
+          reg.defineInstance(IFlagService, stubFlag(false));
         },
       });
       activateAgentEventBus(ix);
