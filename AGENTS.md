@@ -58,7 +58,6 @@ This is a TypeScript monorepo built for agent-assisted development. Keep the roo
 - Internal methods with only a single parameter should not be turned into options objects just for stylistic uniformity.
 - Split functions only along abstraction levels: each function reads as one level of narrative (Step-down Rule), and a wrapper that adds no new abstraction level — especially one with a single call site — is inlined instead of extracted.
 - Except for a package's `index.ts`, other `index.ts` files should prefer `export * from './module';`.
-- When writing or updating tests, follow the `tdd` skill (`.agents/skills/tdd/SKILL.md`).
 - Do not add too many new test files. Prefer adding tests to the existing test file of the corresponding component or module.
 - When a test fails because of a user modification, default to fixing the test first; do not change the implementation to satisfy an old test unless the implementation truly has a bug.
 - Do not sacrifice code quality for external compatibility unless the user explicitly asks for it. Breaking changes go through changesets and a `major` bump, gated by the rule below.
@@ -80,7 +79,7 @@ This is a TypeScript monorepo built for agent-assisted development. Keep the roo
 - Prefer `rg` / `rg --files` when reading code.
 - When designing changes, follow existing boundaries and local patterns first.
 - In public text and test data, replace real internal identifiers with neutral placeholders such as `example.com`, `example.test`, and `YOUR_API_KEY`. Before opening a PR, ask a read-only agent to audit the diff for context-specific internal identifiers.
-- When creating a PR, the PR title must follow Conventional Commit style, e.g. `chore: remove legacy format commands`.
+- When creating a PR, use the `write-pr` skill (`.agents/skills/write-pr/SKILL.md`) to write the PR description. The PR title must follow Conventional Commit style, e.g. `chore: remove legacy format commands`.
 - When an AI agent opens or updates a PR, fill in `.github/pull_request_template.md` — link the related issue or explain the problem, then describe what changed. Do not leave placeholder text or submit a generic summary of the diff.
 - Do not submit vague AI-generated PR text. The human author must understand the change well enough to explain the code, edge cases, and why the approach fits this repository.
 - After finishing a task and before submitting a PR, you must run the `gen-changesets` skill (see `.agents/skills/gen-changesets/SKILL.md`) and generate a changeset under `.changeset/` according to its rules.

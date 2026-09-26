@@ -6,6 +6,61 @@ outline: 2
 
 This page documents the changes in each Kimi Code CLI release.
 
+## 2.1.1 (2026-09-24)
+
+### Polish
+
+- Revert filesystem watchers for config and workspace files to on by default. Set `[watch] enabled` to `false` or `KIMI_CODE_WATCH=0` to keep them off. See [`watch`](../configuration/config-files.md#watch) for details.
+
+### Bug Fixes
+
+- Roll back some of the overly defensive changes in 2.1.0.
+
+## 2.1.0 (2026-09-23)
+
+### Features
+
+- Add an experimental fullscreen mode toggle for the TUI. Enable it via the TUI mode setting in `/settings`, or set `tui_mode = "fullscreen"` in `~/.kimi-code/tui.toml`; it takes effect after restarting Kimi Code.
+- In fullscreen, click a folded block to open or close it.
+- Add a clickable "Jump to bottom" indicator to the fullscreen TUI.
+
+### Polish
+
+- Reduce the CLI's startup time and memory usage.
+- Turn off filesystem watchers for config and workspace files by default. Set `[watch] enabled` to `true` or `KIMI_CODE_WATCH=1` to turn them back on. See [`watch`](../configuration/config-files.md#watch) for details.
+
+### Bug Fixes
+
+- Harden workspace security: block file tools from accessing files outside the working directory through symlinks, apply project-local configuration only after the workspace is trusted, block repository git configuration from executing commands during background git operations, and reject additional directories that resolve to the home directory or filesystem root.
+- Fix several known issues and make various refinements. See the [changelog on GitHub](https://github.com/MoonshotAI/kimi-code/blob/main/apps/kimi-code/CHANGELOG.md) for more technical entries.
+
+## 2.0.2 (2026-09-19)
+
+### Polish
+
+- The agent no longer assumes the current working directory is the project root.
+
+### Bug Fixes
+
+- Fix compaction failing after switching to a model with a smaller context window.
+- Fix new messages occasionally landing at an old position in the conversation after resuming a session.
+- Fix a message sent while the agent was running sometimes appearing twice in the chat.
+- web: Improved interactions and fixed known bugs.
+
+## 2.0.1 (2026-09-18)
+
+### Polish
+
+- Remove the system-prompt rule that forbade all file access outside the working directory.
+- Providers can read their API key from a named environment variable via [`api_key_env`](../configuration/providers.md) in `config.toml`.
+- Stop workspace file watchers from scanning an unbounded project root, and add `[watch] enabled` / `KIMI_CODE_WATCH` to disable watching entirely. See [`watch`](../configuration/config-files.md#watch) for details.
+- Stop asking for approval of bash commands that cannot be statically analyzed in Ask When Needed permission mode.
+- Rename the `kimi install-app` subcommand to `kimi install-desktop`; the old name keeps working as a hidden alias.
+
+### Bug Fixes
+
+- Fix several known issues and make various refinements. See the [changelog on GitHub](https://github.com/MoonshotAI/kimi-code/blob/main/apps/kimi-code/CHANGELOG.md) for more technical entries.
+
 ## 2.0.0 (2026-09-17)
 
 ### Features

@@ -13,7 +13,8 @@ import { BugIndicatingError, Error2, ErrorCodes, onUnexpectedError } from '#/err
 import { IBootstrapService } from '#/app/bootstrap/bootstrap';
 import { ILogService } from '#/_base/log/log';
 import { IAtomicTomlDocumentStore } from '#/persistence/interface/atomicDocumentStore';
-import { watch } from '#human/utils/watch';
+import { setWatchEnabled, watchCandidates } from '#human/utils/watch';
+import { WATCH_SECTION, type WatchConfig } from '#/app/watch/configSection';
 
 import {
   type AnyEnvBindings,
@@ -149,6 +150,38 @@ export function applySectionEnv(
   const target: Record<string, unknown> = isPlainObject(base) ? { ...base } : {};
   applyEnvBindings(target, env, getEnv, onDeprecatedEnv);
   return target;
+}
+
+function collectEnvNames(bindings: AnyEnvBindings, into: string[]): void {
+  if (isEnvBinding(bindings)) {
+    if (typeof bindings === 'string') {
+      into.push(bindings);
+      return;
+    }
+    into.push(bindings.env);
+    if (bindings.deprecatedEnv !== undefined) into.push(bindings.deprecatedEnv);
+    return;
+  }
+  for (const child of Object.values(bindings)) {
+    if (child !== undefined) collectEnvNames(child, into);
+  }
+}
+
+function sameEnvValues(
+  a: readonly (string | undefined)[],
+  b: readonly (string | undefined)[],
+): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+interface EnvSectionResolution {
+  readonly base: unknown;
+  readonly envValues: readonly (string | undefined)[];
+  readonly value: unknown;
 }
 
 function isSameSection(
@@ -332,6 +365,8 @@ export class ConfigService extends Disposable implements IConfigService {
   private lastDiagnosticsSnapshot = '[]';
   private readonly configKey: string;
   private tainted = false;
+  private readonly envNamesBySection = new WeakMap<ConfigSection, readonly string[]>();
+  private readonly envSectionResolutions = new WeakMap<ConfigSection, EnvSectionResolution>();
 
   constructor(
     @IConfigRegistry private readonly registry: IConfigRegistry,
@@ -347,9 +382,10 @@ export class ConfigService extends Disposable implements IConfigService {
     const { configKey } = this;
     const { homeDir } = this.bootstrap;
     this.seedInitialLoad();
+    this.applyWatchEnabled();
     this.ready = this.load('load');
     const configFile = join(homeDir, configKey);
-    const handle = watch(homeDir, { depth: 0 });
+    const handle = watchCandidates(homeDir, [configFile]);
     this._register(handle);
     this._register(
       handle.onDidChange((change) => {
@@ -666,6 +702,7 @@ export class ConfigService extends Disposable implements IConfigService {
     this.applySectionEnvBindings(next, true);
     this.applyEnvOverlay(next);
     this.effective = next;
+    this.applyWatchEnabled();
 
     const candidates = new Set(
       domains ?? [...Object.keys(previous), ...Object.keys(next)],
@@ -675,6 +712,10 @@ export class ConfigService extends Disposable implements IConfigService {
     }
     this.commit(source, [...candidates]);
     this.emitDiagnosticsIfChanged();
+  }
+
+  private applyWatchEnabled(): void {
+    setWatchEnabled(this.get<WatchConfig | undefined>(WATCH_SECTION)?.enabled ?? true);
   }
 
   private deliveredValue(domain: string): unknown {
@@ -716,12 +757,32 @@ export class ConfigService extends Disposable implements IConfigService {
     return validated;
   }
 
+  private sectionEnvNames(section: ConfigSection): readonly string[] {
+    const cached = this.envNamesBySection.get(section);
+    if (cached !== undefined) return cached;
+    const names: string[] = [];
+    if (section.env !== undefined) collectEnvNames(section.env, names);
+    this.envNamesBySection.set(section, names);
+    return names;
+  }
+
   private applySectionEnvBindings(effective: ResolvedConfig, reportErrors: boolean): void {
     const getEnv = (name: string): string | undefined => this.bootstrap.getEnv(name);
     for (const section of this.registry.listSections()) {
       if (section.env === undefined) continue;
+      const base = effective[section.domain];
+      const envValues = this.sectionEnvNames(section).map(getEnv);
+      const resolved = this.envSectionResolutions.get(section);
+      if (
+        !reportErrors &&
+        resolved !== undefined &&
+        resolved.base === base &&
+        sameEnvValues(resolved.envValues, envValues)
+      ) {
+        effective[section.domain] = resolved.value;
+        continue;
+      }
       try {
-        const base = effective[section.domain];
         const onDeprecatedEnv: OnDeprecatedEnv | undefined = reportErrors
           ? (oldName, newName) => {
               this.pushDiagnostic({
@@ -732,8 +793,11 @@ export class ConfigService extends Disposable implements IConfigService {
             }
           : undefined;
         const next = applySectionEnv(base, section.env, getEnv, onDeprecatedEnv);
-        effective[section.domain] = this.registry.validate(section.domain, next);
+        const value = this.registry.validate(section.domain, next);
+        effective[section.domain] = value;
+        this.envSectionResolutions.set(section, { base, envValues, value });
       } catch (error) {
+        this.envSectionResolutions.delete(section);
         if (reportErrors) {
           this.pushDiagnostic({
             domain: section.domain,
