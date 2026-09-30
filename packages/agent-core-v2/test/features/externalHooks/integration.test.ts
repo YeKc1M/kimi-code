@@ -1225,6 +1225,14 @@ describe('IExternalHooksRunnerService integration', () => {
           origin: { kind: 'system_trigger', name: 'goal' },
         }),
       );
+      eventBus.publish(
+        new TurnStarted({
+          agentId: 'main',
+          turnId: 4,
+          origin: { kind: 'user' },
+          prompt: 'user text',
+        }),
+      );
       const queuedContent = [{ type: 'text' as const, text: 'later' }];
       eventBus.publish(
         new PromptQueued({
@@ -1258,6 +1266,17 @@ describe('IExternalHooksRunnerService integration', () => {
             originKind: 'system_trigger',
             originName: 'goal',
             prompt: undefined,
+          },
+        },
+        {
+          event: 'TurnStarted',
+          matcherValue: 'user',
+          inputData: {
+            sessionTitle: 'My Session',
+            turnId: 4,
+            originKind: 'user',
+            originName: undefined,
+            prompt: 'user text',
           },
         },
         {
