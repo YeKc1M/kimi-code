@@ -38,10 +38,12 @@ export interface HookResult {
   readonly action: 'allow' | 'block';
   readonly message?: string;
   readonly reason?: string;
+  readonly permissionDecision?: 'allow' | 'deny';
   readonly stdout?: string;
   readonly stderr?: string;
   readonly exitCode?: number;
   readonly timedOut?: boolean;
+  readonly errored?: boolean;
   readonly structuredOutput?: boolean;
 }
 

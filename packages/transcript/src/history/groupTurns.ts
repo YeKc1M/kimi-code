@@ -2,7 +2,7 @@ import type { AgentTranscriptSnapshot } from '../ops/operation';
 import type { TranscriptAttachment } from '../model/attachment';
 import type { TranscriptFrame, TranscriptUserOrigin } from '../model/frame';
 import type { TranscriptItem, TranscriptMarker } from '../model/item';
-import type { TurnOrigin } from '../model/turn';
+import type { StepTiming, StepUsage, TurnOrigin } from '../model/turn';
 import { daemonFileRefFromPairingPart } from '../contract/mediaRef';
 import { projectTranscriptUserOrigin, projectTranscriptUserTurnOrigin } from '../contract/origin';
 
@@ -11,8 +11,15 @@ export type HistoryMediaSource =
   | { readonly kind: 'base64'; readonly media_type: string; readonly data: string }
   | { readonly kind: 'file' | 'session_media'; readonly file_id: string };
 
+export interface HistoryTextPartMeta {
+  readonly source?: string;
+  readonly contentType?: string;
+  readonly activationId?: string;
+  readonly [key: string]: unknown;
+}
+
 export type HistoryContentPart =
-  | { readonly type: 'text'; readonly text: string }
+  | { readonly type: 'text'; readonly text: string; readonly meta?: HistoryTextPartMeta }
   | { readonly type: 'think'; readonly think: string; readonly hidden?: boolean }
   | { readonly type: 'image' | 'video' | 'audio'; readonly source: HistoryMediaSource; readonly name?: string }
   | {
@@ -23,6 +30,71 @@ export type HistoryContentPart =
       readonly size: number;
     }
   | { readonly type: string };
+
+const USER_PROMPT_SUBMIT_HOOK_SOURCE = 'user prompt submit hook';
+
+export function isUserPromptSubmitHookPart(part: { readonly type: string }): boolean {
+  return (
+    part.type === 'text' &&
+    (part as { readonly meta?: HistoryTextPartMeta }).meta?.source ===
+      USER_PROMPT_SUBMIT_HOOK_SOURCE
+  );
+}
+
+const SKILL_ACTIVATION_PART_SOURCE = 'skill activation';
+
+export function isSkillActivationPart(part: { readonly type: string }): boolean {
+  return (
+    part.type === 'text' &&
+    (part as { readonly meta?: HistoryTextPartMeta }).meta?.source ===
+      SKILL_ACTIVATION_PART_SOURCE
+  );
+}
+
+function annotateBundledSkillParts<T extends { readonly type: string }>(
+  content: readonly T[],
+  bundledActivations: readonly BundledSkillActivation[],
+): T[] {
+  if (bundledActivations.length === 0 || content.some(isSkillActivationPart)) {
+    return [...content];
+  }
+  let index = 0;
+  return content.map((part) => {
+    const activation = bundledActivations[index];
+    if (
+      activation !== undefined &&
+      part.type === 'text' &&
+      (part as { readonly meta?: HistoryTextPartMeta }).meta?.source === undefined
+    ) {
+      index += 1;
+      return {
+        ...part,
+        meta: { source: SKILL_ACTIVATION_PART_SOURCE, activationId: activation.activationId },
+      } as T;
+    }
+    return part;
+  });
+}
+
+export function withoutUserPromptSubmitHookParts<T extends { readonly type: string }>(
+  content: readonly T[],
+): readonly T[] {
+  if (!content.some(isUserPromptSubmitHookPart)) return content;
+  return content.filter((part) => !isUserPromptSubmitHookPart(part));
+}
+
+const USER_PROMPT_HOOK_RESULT_WRAPPER_RE =
+  /^<hook_result hook_event="UserPromptSubmit">\n([\s\S]*)\n<\/hook_result>$/;
+
+function userPromptSubmitHookMarkerPayload(part: { readonly type: string }): {
+  readonly hookEvent: string;
+  readonly content: string;
+} {
+  const text = (part as { readonly text?: unknown }).text;
+  const raw = typeof text === 'string' ? text : '';
+  const match = USER_PROMPT_HOOK_RESULT_WRAPPER_RE.exec(raw);
+  return { hookEvent: 'UserPromptSubmit', content: match?.[1] ?? raw };
+}
 
 export interface HistoryToolCall {
   readonly id: string;
@@ -38,6 +110,8 @@ export interface HistoryMessage {
   readonly toolCallId?: string;
   readonly isError?: boolean;
   readonly origin?: { readonly kind: string };
+  readonly usage?: StepUsage;
+  readonly llmTiming?: StepTiming;
 }
 
 interface TurnDraft {
@@ -54,6 +128,8 @@ interface StepDraft {
   stepId: string;
   ordinal: number;
   frames: TranscriptFrame[];
+  usage?: StepUsage;
+  llmTiming?: StepTiming;
 }
 
 const HIDDEN_USER_ORIGINS = new Set(['injection', 'system_trigger', 'retry']);
@@ -71,6 +147,7 @@ export function groupMessagesIntoSnapshot(
   options?: {
     readonly taskOriginTurnTaskIds?: ReadonlySet<string>;
     readonly steeredContents?: ReadonlyMap<string, ReadonlyMap<string, number>>;
+    readonly steeredByMessageId?: ReadonlyMap<string, readonly string[]>;
     readonly turnPromptIds?: ReadonlySet<string>;
   },
 ): AgentTranscriptSnapshot {
@@ -79,6 +156,7 @@ export function groupMessagesIntoSnapshot(
   const steeredContents = new Map(
     [...(options?.steeredContents ?? [])].map(([key, byKind]) => [key, new Map(byKind)]),
   );
+  const steeredByMessageId = new Map(options?.steeredByMessageId);
   let turn: TurnDraft | undefined;
   let pendingNotificationFrames: {
     text: string;
@@ -218,8 +296,29 @@ export function groupMessagesIntoSnapshot(
     items.push(item);
   };
 
+  const extractBundledSkillMarkers = (message: HistoryMessage): HistoryMessage => {
+    const bundled = bundledSkillActivations(message);
+    const annotated = annotateBundledSkillParts(message.content ?? [], bundled);
+    const skillParts = annotated.filter(isSkillActivationPart);
+    bundled.forEach((activation, index) => {
+      const block = skillParts[index];
+      pushMarker('skill', {
+        text: block !== undefined && block.type === 'text' && 'text' in block ? block.text : '',
+        origin: { kind: 'skill_activation', trigger: 'user-slash', ...activation },
+      });
+    });
+    return { ...message, content: annotated.filter((part) => !isSkillActivationPart(part)) };
+  };
+
   let prevNonTaskRole: string | undefined;
-  for (const message of messages) {
+  for (const entry of messages) {
+    const content =
+      entry.content === undefined ? undefined : withoutUserPromptSubmitHookParts(entry.content);
+    const hookParts =
+      entry.content === undefined || content === entry.content
+        ? []
+        : entry.content.filter(isUserPromptSubmitHookPart);
+    const message = content === entry.content ? entry : { ...entry, content };
     if (message.role === 'system') continue;
     const originKind = message.origin?.kind;
     const isTaskOrigin =
@@ -228,6 +327,9 @@ export function groupMessagesIntoSnapshot(
     if (!isTaskOrigin) prevNonTaskRole = message.role;
 
     if (message.role === 'user') {
+      for (const part of hookParts) {
+        pushMarker('hook', userPromptSubmitHookMarkerPayload(part));
+      }
       if (originKind !== undefined && HIDDEN_USER_ORIGINS.has(originKind)) {
         if (opensOwnTurn(message)) {
           const opening =
@@ -247,25 +349,26 @@ export function groupMessagesIntoSnapshot(
       const steerKind = originKind ?? 'user';
       const opensAsTurnPrompt =
         message.id !== undefined && options?.turnPromptIds?.has(message.id) === true;
-      const steeredByKind = opensAsTurnPrompt ? undefined : steeredContents.get(contentKey);
+      const steeredPromptIds =
+        !opensAsTurnPrompt && message.id !== undefined
+          ? steeredByMessageId.get(message.id)
+          : undefined;
+      const steeredById = steeredPromptIds !== undefined;
+      if (steeredById && message.id !== undefined) steeredByMessageId.delete(message.id);
+      const steeredByKind = opensAsTurnPrompt || steeredById ? undefined : steeredContents.get(contentKey);
       const steeredRemaining = steeredByKind?.get(steerKind) ?? 0;
-      if (steeredByKind !== undefined && steeredRemaining > 0) {
-        steeredByKind.set(steerKind, steeredRemaining - 1);
-        const bundled = bundledSkillActivations(message);
-        const parts = message.content ?? [];
-        bundled.forEach((activation, index) => {
-          const block = parts[index];
-          pushMarker('skill', {
-            text: block !== undefined && block.type === 'text' && 'text' in block ? block.text : '',
-            origin: { kind: 'skill_activation', trigger: 'user-slash', ...activation },
-          });
-        });
-        const opening = foldTurnOpeningInput({ ...message, content: parts.slice(bundled.length) });
+      if (steeredById || (steeredByKind !== undefined && steeredRemaining > 0)) {
+        if (!steeredById) steeredByKind!.set(steerKind, steeredRemaining - 1);
+        const opening = foldTurnOpeningInput(extractBundledSkillMarkers(message));
         pendingNotificationFrames.push({
           text: opening.text,
           taskId: undefined,
           attachmentIds: opening.attachmentIds,
           origin: projectTranscriptUserOrigin(message.origin),
+          promptIds:
+            steeredPromptIds !== undefined && steeredPromptIds.length > 0
+              ? steeredPromptIds
+              : undefined,
           steered: true,
         });
         continue;
@@ -296,15 +399,7 @@ export function groupMessagesIntoSnapshot(
       }
       const bundled = bundledSkillActivations(message);
       if (bundled.length > 0) {
-        const parts = message.content ?? [];
-        bundled.forEach((activation, index) => {
-          const block = parts[index];
-          pushMarker('skill', {
-            text: block !== undefined && block.type === 'text' && 'text' in block ? block.text : '',
-            origin: { kind: 'skill_activation', trigger: 'user-slash', ...activation },
-          });
-        });
-        const callerMessage = { ...message, content: parts.slice(bundled.length) };
+        const callerMessage = extractBundledSkillMarkers(message);
         const opening = foldTurnOpeningInput(callerMessage);
         startTurn(mapOrigin(message), opening.text, opening.attachmentIds, triggerPromptIdOf(message));
         continue;
@@ -321,6 +416,8 @@ export function groupMessagesIntoSnapshot(
         stepId: `${current.turnId}.${stepOrdinal}`,
         ordinal: stepOrdinal,
         frames: [],
+        usage: message.usage,
+        llmTiming: message.llmTiming,
       };
       current.steps.push(step);
       let frameCount = 0;
@@ -551,6 +648,8 @@ function draftToTurnItem(draft: TurnDraft): TranscriptItem {
       ordinal: step.ordinal,
       state: 'completed' as const,
       frames: step.frames,
+      usage: step.usage,
+      llmTiming: step.llmTiming,
     })),
   };
 }

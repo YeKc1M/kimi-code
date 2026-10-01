@@ -31,6 +31,7 @@ import {
   Spacer,
   TuiAltScreen,
   TuiMainScreen,
+  type TuiMouseEventResult,
 } from '@moonshot-ai/pi-tui';
 import { resolve } from 'pathe';
 
@@ -47,6 +48,7 @@ import { quoteShellArg } from '#/utils/shell-quote';
 import { restoreTerminalModes } from '#/utils/terminal-restore';
 
 import { BannerProvider } from './banner/banner-provider';
+import { resolveBannerAudienceContext, type BannerAudienceContext } from './banner/audience';
 import { readBannerDisplayState, writeBannerDisplayState } from './banner/state';
 import {
   BUILTIN_SLASH_COMMANDS,
@@ -158,6 +160,7 @@ import {
   type TUIStartupState,
 } from './types';
 import {
+  countedByExpandHint,
   hasDispose,
   hasHiddenContent,
   isExpandable,
@@ -234,11 +237,11 @@ export interface KimiTUIStartupInput {
 }
 
 type EffectiveActivityPaneMode = ActivityPaneMode | 'idle' | 'session';
-type LoadingTipKind = 'moon' | 'composing';
+type LoadingTipKind = 'moon' | 'braille';
 
 function loadingTipKind(mode: EffectiveActivityPaneMode): LoadingTipKind | undefined {
   if (mode === 'waiting' || mode === 'tool') return 'moon';
-  if (mode === 'composing') return 'composing';
+  if (mode === 'composing' || mode === 'thinking') return 'braille';
   return undefined;
 }
 
@@ -281,6 +284,7 @@ function createInitialAppState(input: KimiTUIStartupInput): AppState {
     streamingStartTime: 0,
     stepRetry: null,
     theme: input.tuiConfig.theme,
+    tuiMode: input.tuiConfig.tuiMode,
     version: input.version,
     editorCommand: input.tuiConfig.editorCommand,
     disablePasteBurst: input.tuiConfig.disablePasteBurst,
@@ -341,6 +345,7 @@ export class KimiTUI {
   private readonly cacheHint = new CacheHintController(this);
   /** Staged prompt media lifecycle (daemon uploads + cache copies) — see StagingLeaseTracker. */
   private readonly staging: StagingLeaseTracker;
+  private readonly steeringQueuedMessages = new Set<QueuedMessage>();
   private readonly approvalController = new ApprovalController();
   private readonly questionController = new QuestionController();
   private readonly reverseRpcDisposers: Array<() => void> = [];
@@ -420,8 +425,16 @@ export class KimiTUI {
    */
   public exitForegroundTask: ((exitCode: number) => Promise<void>) | undefined;
 
-  track(event: string, properties?: Parameters<KimiHarness['track']>[1]): void {
-    this.harness.track(event, properties);
+  track(
+    event: string,
+    properties?: Parameters<KimiHarness['track']>[1],
+    context?: { readonly sessionId?: string },
+  ): void {
+    if (context === undefined) {
+      this.harness.track(event, properties);
+      return;
+    }
+    this.harness.trackWithContext(event, properties, { sessionId: context.sessionId });
   }
 
   constructor(harness: KimiHarness, startupInput: KimiTUIStartupInput) {
@@ -462,6 +475,9 @@ export class KimiTUI {
     this.startupNotice = startupInput.startupNotice;
     this.state = createTUIState(tuiOptions);
     this.state.footer.setExpandHintProvider(() => this.toolOutputExpandHint());
+    this.state.transcriptContainer.setUnhandledClick((index) =>
+      this.toggleClickedFoldBlock(index),
+    );
     this.uninstallRainbowDance = installRainbowDance(() => {
       this.state.ui.requestRender();
     });
@@ -684,9 +700,14 @@ export class KimiTUI {
     const provider = new BannerProvider(this.state.appState.version);
     const displayState = await readBannerDisplayState();
     const now = new Date();
+    const audience = this.harness.auth.getCachedAccessToken().then(
+      (accessToken) => resolveBannerAudienceContext(accessToken),
+      (): BannerAudienceContext => ({ login: 'unknown' }),
+    );
     const banner = await provider.load({
       state: displayState,
       now,
+      audience,
     });
     this.state.appState.banner = banner;
     if (banner === null) return;
@@ -836,6 +857,7 @@ export class KimiTUI {
       this.applyStartupPermissionAndPlanToAppState();
     }
     const resumeState = this.session?.getResumeState();
+    this.surveyController.seedFromResumedAgents(resumeState?.sessionMetadata.agents ?? {});
     if (resumeState?.warning !== undefined) {
       this.showStatus(`Warning: ${resumeState.warning}`, 'warning');
     }
@@ -1613,6 +1635,7 @@ export class KimiTUI {
   recallLastQueued(): QueuedMessage | undefined {
     if (this.state.queuedMessages.length === 0) return undefined;
     const last = this.state.queuedMessages.at(-1)!;
+    if (this.steeringQueuedMessages.has(last)) return undefined;
     this.state.queuedMessages = this.state.queuedMessages.slice(0, -1);
     // A recall restores the draft into the editor — it is not a discard:
     // consumes the retains only, keeping the staged daemon uploads alive
@@ -1649,7 +1672,18 @@ export class KimiTUI {
     },
     mode?: 'prompt' | 'bash',
   ): void {
-    this.state.queuedMessages.push({
+    this.state.queuedMessages.push(this.toQueuedMessage(text, options, mode));
+    this.track('input_queue');
+  }
+
+  private toQueuedMessage(
+    text: string,
+    options?: SendMessageOptions & {
+      readonly inlineSkillActivations?: readonly InlineSkillActivation[];
+    },
+    mode?: 'prompt' | 'bash',
+  ): QueuedMessage {
+    return {
       text,
       agentId: this.harness.interactiveAgentId,
       parts: options?.parts,
@@ -1663,8 +1697,7 @@ export class KimiTUI {
           : undefined,
       mode,
       inlineSkillActivations: options?.inlineSkillActivations,
-    });
-    this.track('input_queue');
+    };
   }
 
   beginSessionRequest(): void {
@@ -1758,7 +1791,7 @@ export class KimiTUI {
 
   handleTurnEnded(event: TurnEndedEvent): void {
     this.staging.handleTurnEnded(event);
-    this.surveyController.notifyTurnEnded();
+    this.surveyController.notifyTurnEnded(event.traceId);
   }
 
   releaseStagingMedia(mediaAttachmentIds: readonly number[]): void {
@@ -1949,53 +1982,23 @@ export class KimiTUI {
   }
 
   private sendMessage(session: Session, input: string, options?: SendMessageOptions): void {
-    const phase = this.state.appState.streamingPhase;
-    // Tower mode keeps the main agent as a long-lived coordinator: while its
-    // turn is live, new input steers into that turn instead of queueing
-    // behind it, so consecutive /tower objectives are accepted immediately
-    // rather than serialized one turn at a time. A foreground shell command
-    // ('shell') has no turn to steer into and keeps queue semantics, as do
-    // input deferral and compaction.
-    const steerIntoCoordinator =
-      this.state.appState.towerMode &&
-      phase !== 'idle' &&
-      phase !== 'shell' &&
-      !this.deferUserMessages &&
-      !this.state.appState.isCompacting;
     // Submission order must survive a mid-turn compaction: objectives queued
     // while compacting stay queued when the turn outlives the compaction, so
     // steering this input ahead of them would reorder the conversation.
     // Prompt-only backlog rides along in the same steer batch, ahead of the
     // new input; a non-steerable backlog (bash, slash-skill, inline-skill
     // bundle) cannot, and then this input queues behind it instead.
-    const backlog = this.state.queuedMessages;
-    const backlogSteerable = backlog.every(
-      (m) => m.inlineSkillActivations === undefined && m.mode !== 'bash' && m.mode !== 'skill',
-    );
-    if (steerIntoCoordinator && backlogSteerable) {
+    if (
+      this.canSteerQueueIntoRunningTurn() &&
+      this.state.queuedMessages.every(isSteerableQueuedMessage)
+    ) {
       // Same lease hand-off as the queue path below: the pre-dispatch lease
-      // defers to the raw ids on the steer item, which re-leases inside
+      // defers to the raw ids on the queue item, which re-leases inside
       // steerMessage and binds to the running turn.
       this.staging.defer(options?.lease);
-      const items: SteerInputItem[] = [
-        ...backlog.map((m) => ({
-          text: m.text,
-          parts: m.parts,
-          imageAttachmentIds: m.imageAttachmentIds,
-          videoAttachmentIds: m.videoAttachmentIds,
-        })),
-        {
-          text: input,
-          parts: options?.parts,
-          imageAttachmentIds: options?.imageAttachmentIds,
-          videoAttachmentIds: options?.videoAttachmentIds,
-        },
-      ];
-      if (backlog.length > 0) {
-        this.state.queuedMessages = [];
-        this.updateQueueDisplay();
-      }
-      this.steerMessage(session, items);
+      this.state.queuedMessages.push(this.toQueuedMessage(input, options));
+      this.updateQueueDisplay();
+      this.steerQueuedMessagesIntoRunningTurn();
       return;
     }
     if (
@@ -2012,7 +2015,99 @@ export class KimiTUI {
     this.sendMessageInternal(session, input, options);
   }
 
-  steerMessage(session: Session, input: readonly SteerInputItem[]): void {
+  // Tower mode keeps the main agent as a long-lived coordinator: while its
+  // turn is live, input steers into that turn instead of queueing behind it,
+  // so consecutive /tower objectives are accepted immediately rather than
+  // serialized one turn at a time. A running WaitFor steers the same way: the
+  // steer ends the wait at once and the model reads the new input, instead of
+  // the input queueing until the wait times out. A foreground shell command
+  // ('shell') has no turn to steer into and keeps queue semantics, as do
+  // input deferral and compaction.
+  private canSteerQueueIntoRunningTurn(): boolean {
+    const phase = this.state.appState.streamingPhase;
+    return (
+      (this.state.appState.towerMode || this.streamingUI.isWaitForRunning()) &&
+      phase !== 'idle' &&
+      phase !== 'shell' &&
+      !this.deferUserMessages &&
+      !this.state.appState.isCompacting
+    );
+  }
+
+  /** Steers the whole queue into the running turn when it is prompt-only.
+   *  The steered items stay at the front of the queue while the steer is in
+   *  flight, and the queue holds (see `shiftQueuedMessage`) so nothing queued
+   *  behind them dispatches first: success removes them, failure leaves them
+   *  queued in place, and a queue left behind by an ended turn drains once
+   *  the steer settles. */
+  steerQueuedMessagesIntoRunningTurn(): void {
+    const session = this.session;
+    if (session === undefined || this.steeringQueuedMessages.size > 0) return;
+    if (!this.canSteerQueueIntoRunningTurn()) return;
+    const batch = [...this.state.queuedMessages];
+    if (batch.length === 0 || !batch.every(isSteerableQueuedMessage)) return;
+    for (const message of batch) this.steeringQueuedMessages.add(message);
+    this.updateQueueDisplay();
+    // Same expiring-upload refresh as the queue drain (`sendQueuedMessage`):
+    // an image whose daemon upload expired falls back to its retained bytes.
+    const items = batch.map((message) => {
+      const item = toSteerInputItem(message);
+      if (message.parts === undefined) return item;
+      return {
+        ...item,
+        parts: refreshExpiringImageFileRefs(
+          message.parts,
+          message.imageAttachmentIds ?? [],
+          this.imageStore,
+        ),
+      };
+    });
+    this.steerMessage(session, items, (steered) => {
+      for (const message of batch) this.steeringQueuedMessages.delete(message);
+      if (this.session !== session) return;
+      if (steered) {
+        const done = new Set(batch);
+        this.state.queuedMessages = this.state.queuedMessages.filter((m) => !done.has(m));
+      }
+      this.updateQueueDisplay();
+      if (steered && this.canSteerQueueIntoRunningTurn()) {
+        this.steerQueuedMessagesIntoRunningTurn();
+        return;
+      }
+      // A turn that ended while the steer was in flight could not drain the
+      // held queue. A prompt dispatched now while the engine still runs a
+      // turn launched by the steer is queued behind it by the engine, so the
+      // order holds either way.
+      this.drainQueueIfIdle();
+    });
+  }
+
+  isSteeringQueuedMessages(): boolean {
+    return this.steeringQueuedMessages.size > 0;
+  }
+
+  private drainQueueIfIdle(): void {
+    if (
+      this.state.appState.streamingPhase !== 'idle' ||
+      this.deferUserMessages ||
+      this.state.appState.isCompacting ||
+      this.state.queuedMessageDispatchPending
+    ) {
+      return;
+    }
+    this.drainOneQueuedMessage();
+  }
+
+  /** `onSettled`, when given, runs once the steer settles. On a rejection its
+   *  staged media is first handed back to raw ownership and the user entries
+   *  added for it are removed, so the caller can keep the input queued
+   *  instead of losing it behind an error; a steer from a session that has
+   *  since been replaced is dropped with that session. */
+  steerMessage(
+    session: Session,
+    input: readonly SteerInputItem[],
+    onSettled?: (steered: boolean) => void,
+  ): void {
     if (this.deferUserMessages || this.state.appState.isCompacting) {
       for (const item of input) {
         this.enqueueMessage(item.text, item);
@@ -2026,8 +2121,9 @@ export class KimiTUI {
       return;
     }
 
+    const steeredEntries: TranscriptEntry[] = [];
     for (const item of input) {
-      this.appendTranscriptEntry({
+      const entry: TranscriptEntry = {
         id: nextTranscriptId(),
         kind: 'user',
         turnId: this.streamingUI.getTurnContext().turnId,
@@ -2037,7 +2133,9 @@ export class KimiTUI {
           item.imageAttachmentIds !== undefined && item.imageAttachmentIds.length > 0
             ? item.imageAttachmentIds
             : undefined,
-      });
+      };
+      steeredEntries.push(entry);
+      this.appendTranscriptEntry(entry);
     }
 
     // Dedupe per item, not across the batch: each queued message retained a
@@ -2063,9 +2161,41 @@ export class KimiTUI {
             ),
           },
     );
-    this.staging.trackDispatch(stagingLease, session.steer(combineSteerInput(resolvedInput)), (error) => {
+    const request = session.steer(combineSteerInput(resolvedInput));
+    if (onSettled !== undefined) {
+      void request.then(
+        () => onSettled(true),
+        () => {},
+      );
+    }
+    this.staging.trackDispatch(stagingLease, request, (error) => {
+      if (onSettled !== undefined) {
+        if (this.session !== session) {
+          onSettled(false);
+          return;
+        }
+        this.staging.defer(stagingLease);
+        this.removeTranscriptEntries(steeredEntries);
+        onSettled(false);
+      }
       this.showError(`Failed to steer: ${formatErrorMessage(error)}`);
     });
+  }
+
+  private removeTranscriptEntries(entries: readonly TranscriptEntry[]): void {
+    const doomed = new Set(entries);
+    const componentsToRemove = this.state.transcriptContainer.children.filter((child) => {
+      const entry = getTranscriptComponentEntry(child);
+      return entry !== undefined && doomed.has(entry);
+    });
+    for (const child of componentsToRemove) {
+      // pi-tui Container.removeChild (not a DOM node); `child.remove()` does not exist.
+      // oxlint-disable-next-line unicorn/prefer-dom-node-remove
+      this.state.transcriptContainer.removeChild(child);
+      if (hasDispose(child)) child.dispose();
+    }
+    this.state.transcriptEntries = this.state.transcriptEntries.filter((e) => !doomed.has(e));
+    this.state.ui.requestRender();
   }
 
   steerSkillActivation(session: Session, skillName: string, skillArgs: string): void {
@@ -2094,6 +2224,7 @@ export class KimiTUI {
   shiftQueuedMessage(): QueuedMessage | undefined {
     if (this.state.queuedMessages.length === 0) return undefined;
     const [first, ...rest] = this.state.queuedMessages;
+    if (this.steeringQueuedMessages.has(first!)) return undefined;
     this.state.queuedMessages = rest;
     return first;
   }
@@ -2683,6 +2814,7 @@ export class KimiTUI {
       this.sessionEventHandler.startSubscription();
     }
     const resumeState = session.getResumeState();
+    this.surveyController.seedFromResumedAgents(resumeState?.sessionMetadata.agents ?? {});
     if (resumeState?.warning !== undefined) {
       this.showStatus(`Warning: ${resumeState.warning}`, 'warning');
     }
@@ -2714,6 +2846,7 @@ export class KimiTUI {
     }
     this.sessionEventHandler.startSubscription();
     const resumeState = session.getResumeState();
+    this.surveyController.seedFromResumedAgents(resumeState?.sessionMetadata.agents ?? {});
     if (resumeState?.warning !== undefined) {
       this.showStatus(`Warning: ${resumeState.warning}`, 'warning');
     }
@@ -3306,10 +3439,10 @@ export class KimiTUI {
   updateActivityPane(): void {
     const effectiveMode = this.resolveActivityPaneMode();
     const tipKind = loadingTipKind(effectiveMode);
-    // Pick a fresh loading tip when the loading kind changes. The same kind
-    // covers waiting/tool (both moon spinners) and any intermediate thinking
-    // phase, so a continuous burst of tool calls does not flip tips. Clear the
-    // cache only when there is no loading UI at all.
+    // Pick a fresh loading tip when the loading kind changes: waiting/tool
+    // share the moon kind and thinking/composing share the braille kind, so a
+    // burst of tool calls or thinking/composing alternation does not flip
+    // tips. Clear the cache only when there is no loading UI at all.
     if (effectiveMode === 'idle' || effectiveMode === 'session' || effectiveMode === 'hidden') {
       this.currentLoadingTip = undefined;
     } else if (
@@ -3367,12 +3500,21 @@ export class KimiTUI {
         break;
       }
       case 'thinking': {
-        this.stopActivitySpinner();
+        const spinner = this.ensureActivitySpinner('braille', 'Thinking…', (s) =>
+          currentTheme.fg('primary', s),
+        );
         this.syncAgentSwarmActivitySpinner(undefined);
+        this.state.activityContainer.addChild(
+          new ActivityPaneComponent({
+            mode: 'thinking',
+            spinner,
+            tip: this.currentLoadingTip?.tip,
+          }),
+        );
         break;
       }
       case 'composing': {
-        const spinner = this.ensureActivitySpinner('braille', 'working…', (s) =>
+        const spinner = this.ensureActivitySpinner('braille', 'Working…', (s) =>
           currentTheme.fg('primary', s),
         );
         this.syncAgentSwarmActivitySpinner(undefined);
@@ -3402,9 +3544,9 @@ export class KimiTUI {
       case 'session': {
         this.stopActivitySpinner();
         this.syncAgentSwarmActivitySpinner(undefined);
-        // Keep a placeholder row so the activity area does not fully shrink
-        // when the spinner is removed at the end of streaming; combined with
-        // pi-tui's clamp, this avoids a destructive full redraw (viewport jump).
+        // Working modes occupy two rows (a spacer above the loader); idle
+        // keeps a one-row placeholder so the dock only shifts once at turn
+        // boundaries instead of on every intra-turn mode flip.
         this.state.activityContainer.addChild(new Spacer(1));
         break;
       }
@@ -3443,7 +3585,7 @@ export class KimiTUI {
         messages: queued,
         isCompacting: this.state.appState.isCompacting,
         isStreaming: this.state.appState.streamingPhase !== 'idle',
-        canSteerImmediately: !this.deferUserMessages,
+        canSteerImmediately: !this.deferUserMessages && !this.isSteeringQueuedMessages(),
       }),
     );
   }
@@ -3476,15 +3618,30 @@ export class KimiTUI {
       // card with hidden content keeps the collapse hint on.
       for (let i = children.length - 1; i >= 0; i--) {
         const child = children[i];
-        if (isExpandedComponent(child) && hasHiddenContent(child)) return 'collapse';
+        if (isExpandedComponent(child) && countedByExpandHint(child)) return 'collapse';
       }
       return null;
     }
     const cutoff = this.expandCutoff(children);
     for (let i = children.length - 1; i >= cutoff; i--) {
-      if (hasHiddenContent(children[i])) return 'expand';
+      if (countedByExpandHint(children[i])) return 'expand';
     }
     return null;
+  }
+
+  private toggleClickedFoldBlock(index: number): TuiMouseEventResult | undefined {
+    const children = this.state.transcriptContainer.children;
+    const hit = children[index];
+    if (hit === undefined || !isExpandable(hit) || !hasHiddenContent(hit)) return undefined;
+    if (isExpandedComponent(hit)) {
+      hit.setExpanded(false);
+    } else if (index >= this.expandCutoff(children)) {
+      hit.setExpanded(true);
+    } else {
+      return undefined;
+    }
+    this.state.ui.requestRender();
+    return { handled: true };
   }
 
   toggleToolOutputExpansion(): void {
@@ -3751,7 +3908,7 @@ export class KimiTUI {
   // =========================================================================
 
   mountEditorReplacement(panel: Component & Focusable): void {
-    this.surveyController.closeSilently();
+    this.surveyController.notifyDisplaced();
     this.state.editorReplacementMounted = true;
     this.state.editorContainer.clear();
     this.state.editorContainer.addChild(panel);
@@ -3829,12 +3986,11 @@ export class KimiTUI {
   /**
    * agent-core-v2 startup gate: before any session is created, ask whether to
    * trust this folder when the workspace is not trusted yet (project-level MCP
-   * servers stay disabled while untrusted). Best-effort throughout — a failed
-   * check or trust write never blocks startup. Choosing "don't trust" (or Esc)
-   * exits the program before any session is created; the prompt reappears on
-   * the next launch: the engine's untrusted state is indistinguishable from
-   * never-trusted. Returns true when the prompt started the event loop (the
-   * caller must not start it again).
+   * servers stay disabled while untrusted). A failed trust-info read is treated
+   * as untrusted and still prompts. Choosing "don't trust" (or Esc) exits the
+   * program before any session is created. A failed trust write still enters
+   * the TUI for this process and re-asks on the next launch. Returns true when
+   * the prompt started the event loop (the caller must not start it again).
    */
   private async maybeRunWorkspaceTrustPrompt(): Promise<boolean> {
     const workDir = this.state.appState.workDir;
@@ -3842,16 +3998,27 @@ export class KimiTUI {
     try {
       info = await this.harness.getWorkspaceTrustInfo(workDir);
     } catch {
+      info = {
+        trusted: false,
+        gatedMcpServers: [],
+        gatedAdditionalDirs: [],
+        additionalDirSources: [],
+        warnings: ['Could not inspect project settings.'],
+        instructionSources: { agentsMdPaths: [], skills: [], agentProfiles: [], paths: [] },
+      };
+    }
+    if (info.trusted) {
       return false;
     }
-    if (info.trusted) return false;
     this.startEventLoop();
     const choice = await new Promise<TrustPromptChoice>((resolve) => {
       this.state.activeDialog = 'trust-prompt';
       this.mountEditorReplacement(
         new TrustPromptComponent({
           workDir,
-          gatedMcpServers: info.gatedMcpServers,
+          info,
+          getAvailableRows: () =>
+            this.state.terminal.rows - (this.state.ui instanceof TuiAltScreen ? 1 : 0),
           onSelect: (c) => {
             resolve(c);
           },
@@ -3871,7 +4038,6 @@ export class KimiTUI {
     try {
       await this.harness.trustWorkspace(workDir);
     } catch {
-      // A failed write leaves the workspace untrusted (re-asked next launch).
     }
     return true;
   }
@@ -4188,4 +4354,21 @@ export class KimiTUI {
     this.patchLivePane({ pendingQuestion: null });
     this.restoreEditor();
   }
+}
+
+function isSteerableQueuedMessage(message: QueuedMessage): boolean {
+  return (
+    message.inlineSkillActivations === undefined &&
+    message.mode !== 'bash' &&
+    message.mode !== 'skill'
+  );
+}
+
+function toSteerInputItem(message: QueuedMessage): SteerInputItem {
+  return {
+    text: message.text,
+    parts: message.parts,
+    imageAttachmentIds: message.imageAttachmentIds,
+    videoAttachmentIds: message.videoAttachmentIds,
+  };
 }

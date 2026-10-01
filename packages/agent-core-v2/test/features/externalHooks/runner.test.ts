@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { buildHookSpawnOptions, runHook } from '#/features/externalHooks/internal/runHook';
+import { renderUserPromptHookResult } from '#/features/externalHooks/internal/userPrompt';
 import { HostProcessService } from '#/os/backends/node-local/hostProcessService';
 
 const hostProcess = new HostProcessService();
@@ -55,6 +56,43 @@ describe('runHook process runner', () => {
     expect(emptyHookSpecificOutput.action).toBe('allow');
     expect(emptyHookSpecificOutput.message).toBeUndefined();
     expect(emptyHookSpecificOutput.structuredOutput).toBe(true);
+
+    expect(renderUserPromptHookResult([emptyObject, emptyHookSpecificOutput])).toBeUndefined();
+
+    const continueOnly = await runHook(
+      hostProcess,
+      nodeCommand('process.stdout.write(JSON.stringify({ continue: true }));'),
+      {},
+      { timeout: 5 },
+    );
+    expect(renderUserPromptHookResult([continueOnly])).toBeUndefined();
+
+    const plainText = await runHook(
+      hostProcess,
+      nodeCommand('process.stdout.write("hook note");'),
+      {},
+      { timeout: 5 },
+    );
+    const secondNote = await runHook(
+      hostProcess,
+      nodeCommand('process.stdout.write("second note");'),
+      {},
+      { timeout: 5 },
+    );
+    const rendered = renderUserPromptHookResult([plainText, secondNote]);
+    expect(rendered?.messages).toEqual(['hook note', 'second note']);
+    expect(rendered?.parts).toEqual([
+      {
+        type: 'text',
+        text: '<hook_result hook_event="UserPromptSubmit">\nhook note\n</hook_result>',
+        meta: { contentType: 'text/xml', source: 'user prompt submit hook' },
+      },
+      {
+        type: 'text',
+        text: '<hook_result hook_event="UserPromptSubmit">\nsecond note\n</hook_result>',
+        meta: { contentType: 'text/xml', source: 'user prompt submit hook' },
+      },
+    ]);
   });
 
   it('returns block when the hook exits 2 and captures stderr as the reason', async () => {
@@ -104,6 +142,73 @@ describe('runHook process runner', () => {
 
     expect(result.action).toBe('block');
     expect(result.reason).toBe('use rg');
+    expect(result.permissionDecision).toBe('deny');
+  });
+
+  it('parses stdout JSON permissionDecision=allow into an explicit allow decision', async () => {
+    const result = await runHook(
+      hostProcess,
+      nodeCommand(
+        'process.stdout.write(JSON.stringify({ hookSpecificOutput: { permissionDecision: "allow" } }));',
+      ),
+      { tool_name: 'Bash' },
+      { timeout: 5 },
+    );
+
+    expect(result.action).toBe('allow');
+    expect(result.permissionDecision).toBe('allow');
+  });
+
+  it('parses permissionDecision=deny without a reason into a block with no reason', async () => {
+    const result = await runHook(
+      hostProcess,
+      nodeCommand(
+        'process.stdout.write(JSON.stringify({ hookSpecificOutput: { permissionDecision: "deny" } }));',
+      ),
+      { tool_name: 'Bash' },
+      { timeout: 5 },
+    );
+
+    expect(result.action).toBe('block');
+    expect(result.reason).toBeUndefined();
+    expect(result.permissionDecision).toBe('deny');
+  });
+
+  it('ignores unrecognized permissionDecision values', async () => {
+    const unknownString = await runHook(
+      hostProcess,
+      nodeCommand(
+        'process.stdout.write(JSON.stringify({ hookSpecificOutput: { permissionDecision: "ask" } }));',
+      ),
+      { tool_name: 'Bash' },
+      { timeout: 5 },
+    );
+    expect(unknownString.action).toBe('allow');
+    expect(unknownString.permissionDecision).toBeUndefined();
+
+    const nonString = await runHook(
+      hostProcess,
+      nodeCommand(
+        'process.stdout.write(JSON.stringify({ hookSpecificOutput: { permissionDecision: 1 } }));',
+      ),
+      { tool_name: 'Bash' },
+      { timeout: 5 },
+    );
+    expect(nonString.action).toBe('allow');
+    expect(nonString.permissionDecision).toBeUndefined();
+  });
+
+  it('fails open with no decision when stdout is not valid JSON', async () => {
+    const result = await runHook(
+      hostProcess,
+      nodeCommand('process.stdout.write("not json {");'),
+      { tool_name: 'Bash' },
+      { timeout: 5 },
+    );
+
+    expect(result.action).toBe('allow');
+    expect(result.permissionDecision).toBeUndefined();
+    expect(result.structuredOutput).toBeUndefined();
   });
 
   it('writes the input payload to the hook process stdin as JSON', async () => {

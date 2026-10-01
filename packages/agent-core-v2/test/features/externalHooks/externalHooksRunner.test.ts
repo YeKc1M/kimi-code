@@ -1,8 +1,12 @@
 import { realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 
+import { permissionDecisionFromResults } from '#/features/externalHooks/internal/matchHooks';
+import type { HookResult } from '#/features/externalHooks/internal/types';
 import type { ContentPart } from '#human/llm/message';
 import { describe, expect, it, vi } from 'vitest';
+
+import { ITelemetryService } from '#/app/telemetry/telemetry';
 
 import { makeHookRunner } from './runner-stub';
 
@@ -290,6 +294,50 @@ describe('ExternalHooksRunnerService', () => {
     expect(results[0]?.action).toBe('block');
   });
 
+  it('reports external_hook_resolved telemetry only when hooks run', async () => {
+    const tracked: [string, unknown][] = [];
+    const telemetry = {
+      track2: (event: string, properties: unknown) => tracked.push([event, properties]),
+    } as unknown as ITelemetryService;
+    const runner = makeHookRunner(
+      [
+        { event: 'PreToolUse', matcher: 'Bash', command: nodeCommand('process.exit(2);'), timeout: 5 },
+        { event: 'PreToolUse', matcher: 'Bash', command: nodeCommand('process.exit(1);'), timeout: 5 },
+      ],
+      { telemetry },
+    );
+
+    await runner.trigger('PreToolUse', { matcherValue: 'Bash', inputData: {} });
+    await runner.trigger('PreToolUse', { matcherValue: 'Grep', inputData: {} });
+
+    const spawnFailRunner = makeHookRunner(
+      [{ event: 'PreToolUse', matcher: 'Bash', command: 'true', timeout: 5, cwd: '/nonexistent-hook-cwd' }],
+      { telemetry },
+    );
+    await spawnFailRunner.trigger('PreToolUse', { matcherValue: 'Bash', inputData: {} });
+
+    expect(tracked).toEqual([
+      [
+        'external_hook_resolved',
+        {
+          event: 'PreToolUse',
+          action: 'block',
+          matched_count: 2,
+          failed_count: 1,
+        },
+      ],
+      [
+        'external_hook_resolved',
+        {
+          event: 'PreToolUse',
+          action: 'allow',
+          matched_count: 1,
+          failed_count: 1,
+        },
+      ],
+    ]);
+  });
+
   it('injects the bootstrap client platform as client_type into every payload', async () => {
     const runner = makeHookRunner([
       {
@@ -340,5 +388,46 @@ describe('ExternalHooksRunnerService', () => {
     expect(runner.hasHooksFor('PreToolUse')).toBe(true);
     expect(runner.hasHooksFor('SessionHeartbeat')).toBe(true);
     expect(runner.hasHooksFor('Stop')).toBe(false);
+  });
+});
+
+describe('permissionDecisionFromResults', () => {
+  const allowResult: HookResult = { action: 'allow' };
+
+  it('returns undefined for empty results and results without an explicit decision', () => {
+    expect(permissionDecisionFromResults([])).toBeUndefined();
+    expect(permissionDecisionFromResults([allowResult])).toBeUndefined();
+    expect(
+      permissionDecisionFromResults([{ action: 'block', reason: 'exit code 2' }]),
+    ).toBeUndefined();
+  });
+
+  it('aggregates an explicit allow when no hook denies', () => {
+    expect(
+      permissionDecisionFromResults([
+        allowResult,
+        { action: 'allow', permissionDecision: 'allow' },
+      ]),
+    ).toEqual({ decision: 'allow' });
+  });
+
+  it('prefers any deny over allow and carries its reason', () => {
+    expect(
+      permissionDecisionFromResults([
+        { action: 'allow', permissionDecision: 'allow' },
+        { action: 'block', permissionDecision: 'deny', reason: 'not today' },
+      ]),
+    ).toEqual({ decision: 'deny', reason: 'not today' });
+  });
+
+  it('fills a default deny reason when the hook result has none', () => {
+    expect(
+      permissionDecisionFromResults([{ action: 'block', permissionDecision: 'deny' }]),
+    ).toEqual({ decision: 'deny', reason: 'Denied by PermissionRequest hook' });
+    expect(
+      permissionDecisionFromResults([
+        { action: 'block', permissionDecision: 'deny', reason: '   ' },
+      ]),
+    ).toEqual({ decision: 'deny', reason: 'Denied by PermissionRequest hook' });
   });
 });

@@ -122,6 +122,7 @@ export interface SessionEventHost {
   updateTerminalTitle(): void;
   sendQueuedMessage(session: Session, item: QueuedMessage): void;
   shiftQueuedMessage(): QueuedMessage | undefined;
+  steerQueuedMessagesIntoRunningTurn(): void;
   handleTurnStarted?(event: TurnStartedEvent): void;
   handleTurnEnded?(event: TurnEndedEvent): void;
   readonly btwPanelController: BtwPanelController;
@@ -302,6 +303,8 @@ export class SessionEventHandler {
       case 'compaction.blocked': break;
       case 'compaction.cancelled': this.handleCompactionCancel(event, sendQueued); break;
       case 'subagent.spawned':
+        this.host.surveyController.notifySubagentSpawned(event);
+        this.subAgentEventHandler.handleLifecycleEvent(event); break;
       case 'subagent.started':
       case 'subagent.suspended':
       case 'subagent.completed':
@@ -619,7 +622,7 @@ export class SessionEventHandler {
 
   private handleToolCall(event: ToolCallStartedEvent): void {
     const { streamingUI } = this.host;
-    this.host.surveyController.notifyToolCallStarted();
+    this.host.surveyController.notifyToolCallStarted(event.toolCallId, event.name);
     streamingUI.flushNow();
     const { turnId, step } = streamingUI.getTurnContext();
     const toolCall: ToolCallBlockData = {
@@ -668,6 +671,11 @@ export class SessionEventHandler {
   }
 
   private handleToolProgress(event: ToolProgressEvent): void {
+    // Input queued before the wait began would otherwise sit until the wait
+    // returns; steering it now ends the wait so the model reads it first.
+    if (this.host.streamingUI.markWaitForRunning(event.toolCallId)) {
+      this.host.steerQueuedMessagesIntoRunningTurn();
+    }
     const text = event.update.text;
     if (text === undefined || text.length === 0) return;
     const tc = this.host.streamingUI.getToolComponent(event.toolCallId);
@@ -683,6 +691,7 @@ export class SessionEventHandler {
 
   private handleToolResult(event: ToolResultEvent): void {
     const { streamingUI } = this.host;
+    this.host.surveyController.notifyToolCallEnded(event.toolCallId);
     streamingUI.flushNow();
     this.clearStepRetry();
     const resultData: ToolResultBlockData = {

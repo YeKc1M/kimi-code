@@ -724,12 +724,19 @@ export interface AgentStateSnapshot {
     readonly content: (/* ContentPart — packages/agent-core-v2/src/human/llm/message.ts */ /* TextPart — packages/agent-core-v2/src/human/llm/message.ts */ {
       type: 'text';
       text: string;
+      meta?: /* TextPartMeta — packages/agent-core-v2/src/human/llm/message.ts */ {
+        source?: string;
+        contentType?: string;
+        activationId?: string;
+        [key: string]: unknown;
+      };
     } | /* ThinkPart — packages/agent-core-v2/src/human/llm/message.ts */ {
       type: 'think';
       think: string;
       encrypted?: string;
       detailsIndex?: number;
       hidden?: boolean;
+      reasoningKey?: string;
     } | /* ImageURLPart — packages/agent-core-v2/src/human/llm/message.ts */ {
       type: 'image_url';
       imageUrl: {
@@ -773,6 +780,7 @@ export interface AgentStateSnapshot {
     readonly providerMessageId?: string;
     readonly origin?: /* UserPromptOrigin — packages/agent-core-v2/src/agent/contextMemory/types.ts */ {
       readonly kind: 'user';
+      readonly inTurn?: true;
       readonly clientMetadata?: readonly Readonly<Record<string, unknown>>[];
       readonly skillActivations?: readonly /* BundledSkillActivation — packages/agent-core-v2/src/agent/contextMemory/types.ts */ {
         readonly activationId: string;
@@ -790,6 +798,7 @@ export interface AgentStateSnapshot {
       }[];
     } | /* SkillActivationOrigin — packages/agent-core-v2/src/agent/contextMemory/types.ts */ {
       readonly kind: 'skill_activation';
+      readonly inTurn?: true;
       readonly clientMetadata?: readonly Readonly<Record<string, unknown>>[];
       readonly activationId: string;
       readonly skillName: string;
@@ -806,6 +815,7 @@ export interface AgentStateSnapshot {
       }[];
     } | /* PluginCommandOrigin — packages/agent-core-v2/src/agent/contextMemory/types.ts */ {
       readonly kind: 'plugin_command';
+      readonly inTurn?: true;
       readonly activationId: string;
       readonly pluginId: string;
       readonly commandName: string;
@@ -921,6 +931,18 @@ export interface AgentStateSnapshot {
       detail?: unknown;
     }>;
     readonly note?: string;
+    readonly usage?: /* TokenUsage — packages/agent-core-v2/src/human/llm/usage.ts */ {
+      inputOther: number;
+      output: number;
+      inputCacheRead: number;
+      inputCacheCreation: number;
+      raw?: Record<string, unknown>;
+    };
+    readonly llmTiming?: /* ContextMessageTiming — packages/agent-core-v2/src/agent/contextMemory/types.ts */ {
+      readonly llmFirstTokenLatencyMs?: number;
+      readonly llmStreamDurationMs?: number;
+    };
+    readonly durationMs?: number;
   })[];
   // src/agent/contextProjector/contextProjectorService.ts
   'contextProjector.lastRepairSignature': string | null;
@@ -1018,12 +1040,19 @@ export interface AgentStateSnapshot {
   'media.resolved': Map<string, /* ContentPart — packages/agent-core-v2/src/human/llm/message.ts */ /* TextPart — packages/agent-core-v2/src/human/llm/message.ts */ {
     type: 'text';
     text: string;
+    meta?: /* TextPartMeta — packages/agent-core-v2/src/human/llm/message.ts */ {
+      source?: string;
+      contentType?: string;
+      activationId?: string;
+      [key: string]: unknown;
+    };
   } | /* ThinkPart — packages/agent-core-v2/src/human/llm/message.ts */ {
     type: 'think';
     think: string;
     encrypted?: string;
     detailsIndex?: number;
     hidden?: boolean;
+    reasoningKey?: string;
   } | /* ImageURLPart — packages/agent-core-v2/src/human/llm/message.ts */ {
     type: 'image_url';
     imageUrl: {

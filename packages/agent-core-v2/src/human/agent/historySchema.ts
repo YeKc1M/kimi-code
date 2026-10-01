@@ -3,13 +3,18 @@ import { z } from 'zod';
 import type { PromptOrigin } from './origin';
 import type { HistoryMessage } from './turn';
 
-const textPartSchema = z.object({ type: z.literal('text'), text: z.string() });
+const textPartSchema = z.object({
+  type: z.literal('text'),
+  text: z.string(),
+  meta: z.record(z.string(), z.unknown()).optional(),
+});
 const thinkPartSchema = z.object({
   type: z.literal('think'),
   think: z.string(),
   encrypted: z.string().optional(),
   detailsIndex: z.number().optional(),
   hidden: z.boolean().optional(),
+  reasoningKey: z.string().optional(),
 });
 const imageUrlPartSchema = z.object({
   type: z.literal('image_url'),

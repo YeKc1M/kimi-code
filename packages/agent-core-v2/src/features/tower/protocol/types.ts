@@ -11,6 +11,7 @@ export interface TowerRosterEntry {
   readonly worktree?: string;
   readonly branch?: string;
   readonly spawnedAt: string;
+  readonly lastInboxReadAt?: string;
   readonly diedAt?: string;
   readonly deathStatus?: string;
   readonly deathReason?: string;
@@ -34,6 +35,7 @@ export type TowerMissionKind = 'build' | 'survey';
 export interface TowerMissionTask {
   text: string;
   done: boolean;
+  dropped?: boolean;
 }
 
 export interface TowerMission {

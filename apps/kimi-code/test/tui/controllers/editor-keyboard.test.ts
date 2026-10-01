@@ -19,7 +19,7 @@ interface Harness {
     readonly handlePreInput: ReturnType<typeof vi.fn<(data: string) => boolean>>;
     readonly handleSubmit: ReturnType<typeof vi.fn<(text: string) => boolean>>;
     readonly handleEditorChange: ReturnType<typeof vi.fn<(text: string) => void>>;
-    readonly closeSilently: ReturnType<typeof vi.fn<() => void>>;
+    readonly notifyDisplaced: ReturnType<typeof vi.fn<() => void>>;
   };
 }
 
@@ -39,7 +39,7 @@ function createHarness(options: { streamingPhase?: string; isCompacting?: boolea
     handlePreInput: vi.fn<(data: string) => boolean>(() => false),
     handleSubmit: vi.fn<(text: string) => boolean>(() => false),
     handleEditorChange: vi.fn<(text: string) => void>(() => {}),
-    closeSilently: vi.fn<() => void>(() => {}),
+    notifyDisplaced: vi.fn<() => void>(() => {}),
   };
   const session = { cancel: vi.fn(async () => {}), cancelCompaction };
 
@@ -487,6 +487,7 @@ describe('EditorKeyboardController Ctrl-S steering', () => {
     editorText: string;
     queued: Array<Record<string, unknown>>;
     skillCommandMap?: Map<string, string>;
+    steering?: boolean;
   }) {
     const steerMessage = vi.fn();
     const steerSkillActivation = vi.fn();
@@ -513,6 +514,7 @@ describe('EditorKeyboardController Ctrl-S steering', () => {
       steerMessage,
       steerSkillActivation,
       updateQueueDisplay,
+      isSteeringQueuedMessages: vi.fn(() => options.steering ?? false),
       validateMediaCapabilities: vi.fn(() => true),
       showError: vi.fn(),
       track: vi.fn(),
@@ -564,6 +566,25 @@ describe('EditorKeyboardController Ctrl-S steering', () => {
     expect(steerSkillActivation).toHaveBeenCalledWith(host.session, 'tower', 'status');
     expect(host.state.queuedMessages).toEqual([{ text: '!ls', agentId: 'main', mode: 'bash' }]);
     expect(updateQueueDisplay).toHaveBeenCalled();
+  });
+
+  it('ignores Ctrl-S while an automatic queue steer is still in flight', () => {
+    const queued = [
+      { text: 'already steering', agentId: 'main' },
+      { text: 'later text', agentId: 'main' },
+    ];
+    const { host, setText, steerMessage, steerSkillActivation, onCtrlS } = createCtrlSHarness({
+      editorText: 'draft',
+      queued,
+      steering: true,
+    });
+
+    onCtrlS();
+
+    expect(steerMessage).not.toHaveBeenCalled();
+    expect(steerSkillActivation).not.toHaveBeenCalled();
+    expect(setText).not.toHaveBeenCalled();
+    expect(host.state.queuedMessages).toEqual(queued);
   });
 
   it('steers plain queued messages but keeps grouped inline-skill submissions queued', () => {
@@ -728,7 +749,7 @@ describe('EditorKeyboardController survey wiring', () => {
     expect(host.handleUserInput).toHaveBeenCalledWith('hello');
   });
 
-  it('closes the survey silently when the external editor opens', () => {
+  it('displaces the survey when the external editor opens', () => {
     vi.stubEnv('VISUAL', '');
     vi.stubEnv('EDITOR', '');
     try {
@@ -737,7 +758,7 @@ describe('EditorKeyboardController survey wiring', () => {
 
       onOpenExternalEditor();
 
-      expect(survey.closeSilently).toHaveBeenCalled();
+      expect(survey.notifyDisplaced).toHaveBeenCalled();
     } finally {
       vi.unstubAllEnvs();
     }
